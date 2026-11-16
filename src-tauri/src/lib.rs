@@ -613,18 +613,7 @@ mod lifecycle_tests {
         let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = reservation.local_addr().unwrap().port();
         drop(reservation);
-        let mut command = Command::new("python3");
-        command
-            .args([
-                "-m",
-                "http.server",
-                &port.to_string(),
-                "--bind",
-                "127.0.0.1",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        let command = fixture_command(port);
         let child = register_tunnel(&cleanup.0, "test-recovery", command, port).unwrap();
         ssh_ready(child.clone(), port).unwrap();
         let first_pid = {
@@ -652,6 +641,37 @@ mod lifecycle_tests {
         assert!(child.lock().unwrap().process.try_wait().unwrap().is_some());
         assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
     }
+    #[test]
+    #[ignore = "Subprocess HTTP fixture invoked by lifecycle tests only"]
+    fn http_fixture_child() {
+        let port: u16 = std::env::var("DSH_CLIENT_HTTP_FIXTURE_PORT")
+            .expect("fixture port required")
+            .parse()
+            .unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        for incoming in listener.incoming() {
+            let mut stream = incoming.unwrap();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+        }
+    }
+    fn fixture_command(port: u16) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "lifecycle_tests::http_fixture_child",
+            ])
+            .env("DSH_CLIENT_HTTP_FIXTURE_PORT", port.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
     struct Fixture(Connections);
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -663,18 +683,7 @@ mod lifecycle_tests {
         let reserved = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = reserved.local_addr().unwrap().port();
         drop(reserved);
-        let mut command = Command::new("python3");
-        command
-            .args([
-                "-m",
-                "http.server",
-                &port.to_string(),
-                "--bind",
-                "127.0.0.1",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        let command = fixture_command(port);
         let child = register_tunnel(&fixture.0, "test", command, port).unwrap();
         ssh_ready(child.clone(), port).unwrap();
         (fixture, child, port)
