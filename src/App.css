@@ -1,5 +1,3 @@
-@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
-
 :root { font-family: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #eef2f4; background: #111517; font-synthesis: none; text-rendering: optimizeLegibility; -webkit-font-smoothing: antialiased; }
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradient(circle at 20% 0%, #1d292c 0, #111517 48%), #111517; }
@@ -51,3 +49,7 @@ h2 { margin-bottom: 0; font-size: 20px; letter-spacing: -.01em; }
 .footer-note { display: flex; justify-content: center; gap: 10px; padding-top: 24px; color: #697778; font: 11px 'DM Mono', monospace; }
 @media (max-width: 840px) { .app-shell { padding: 32px 18px 24px; } .topbar { display: grid; } .workspace-grid { grid-template-columns: 1fr; } .status-pill { justify-self: start; } }
 @media (max-width: 480px) { .connection-row { grid-template-columns: 32px 1fr; } .connection-actions { grid-column: 2; justify-content: flex-start; } .connection-mark { width: 30px; height: 30px; } .form-row { grid-template-columns: 1fr; } .footer-note { flex-wrap: wrap; } }
+
+.connection-meta small { color: #8cac9f; font-size: 11px; }
+.connection-meta input, select { width: 100%; padding: 9px; border: 1px solid #3b4a4c; border-radius: 4px; background: #12191a; color: #eef2f4; font-size: 12px; }
+button:disabled { opacity: .5; cursor: wait; }

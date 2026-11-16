@@ -1,35 +1,27 @@
-# MacBook Air .13
+# MacBook Air .13 安装与测试
 
-目标：`dsh-air`（使用 `~/.ssh/dsh-fleet-config`），已核实 arm64、macOS 27.0.1。
+目标 dsh-air，SSH 配置 ~/.ssh/dsh-fleet-config，用户 zcj123v，arm64/macOS 27.0.1。安装路径 ~/Applications/DSH Client.app，不注册自启、不动 DSH worker。此配置用于分发；客户端 SSH 转发配置另由用户选择。
 
-## 安装前
+## 分发
 
-从本机完成 `pnpm test`、`pnpm typecheck`、`pnpm build`、`cargo check` 和 macOS arm64 Tauri build 后，记录产物 SHA-256。安装只写用户目录，不改 DSH worker、profile、LaunchAgent 或自启。
-
-## 传输与安装
+在构建机完成测试和 --bundles app --no-sign 后，用 ditto 生成 ZIP，记录 SHA-256。scp 到 .13 临时目录，远端核对 ZIP 与 Mach-O 二进制哈希和架构。更新前关闭 **客户端**，保留旧 APP；不要 restart/kickstart DSH。
 
 ```bash
-scp -F ~/.ssh/dsh-fleet-config <DSH_CLIENT_DMG> dsh-air:/tmp/DSH-Client-arm64.dmg
-ssh -F ~/.ssh/dsh-fleet-config dsh-air 'shasum -a 256 /tmp/DSH-Client-arm64.dmg'
+scp -F ~/.ssh/dsh-fleet-config <verified-zip> dsh-air:/tmp/DSH-Client-arm64.zip
+ssh -F ~/.ssh/dsh-fleet-config dsh-air 'shasum -a 256 /tmp/DSH-Client-arm64.zip'
 ```
 
-在 `.13` 图形会话中打开 DMG，把 `DSH Client.app` 拖到用户 `~/Applications`（如目录不存在先创建），首次启动选择“打开”。本轮未签名，不执行系统级安装，不注册 LaunchAgent。
+解压到独立临时目录，用 ditto 复制 APP 到用户 Applications，open 启动。未签名测试包如触发 Gatekeeper，在 Finder 右键打开，仅对本次受信任产物操作。
 
-## 验收
+## 用户测试步骤
 
-1. 添加 direct `http://127.0.0.1:3080/` 连接，打开目标 DSH 根页面并手动粘贴 token。
-2. 验证会话列表、流式输出、附件/文件入口和断线后的页面重连。
-3. 添加一个 SSH-forward 连接，填写 `~/.ssh/dsh-fleet-config` 的 Host 别名和远端 DSH 端口，确认本机 loopback 转发可用。
-4. 打开两个连接窗口，确认认证和本地存储不串线。
-5. 关闭客户端后检查没有残留由客户端启动的 `ssh -N -L` 进程；不要重启 DSH worker。
+1. 新建 HTTPS/Web 连接：名称“.13 本机”，地址 127.0.0.1:3080；保存。
+2. 在左侧这条连接的一次性 token 框粘贴当前 worker 的 token **字符串**，点“打开 / 重试”。认证失效后重复此步，不把 ?token= URL 保存为地址。
+3. 查看工作区/会话和模型选择，发一条最小消息，确认回复持续更新。关闭连接窗口再空 token 打开，确认 Cookie 恢复。
+4. 新建 SSH 转发：选择正确 SSH 配置、Host 别名、用户与远端端口。先用终端确认该 Host 可非交互公钥登录且已确认指纹。dsh-service 受限 key 若不允许转发，需要普通用户转发权限。
+5. 窗口关闭/客户端退出后核对所属 ssh 子进程已消失；不以 HTTP 401 判为业务通过。
+6. 编辑保存会关闭旧窗口；删除会请求系统异步清理浏览数据，严格清理完成仍需独立测试。
 
 ## 回滚
 
-```bash
-rm -rf "$HOME/Applications/DSH Client.app"
-rm -rf "$HOME/Library/Application Support/com.zcj.dshclient"
-rm -rf "$HOME/Library/Caches/com.zcj.dshclient"
-rm -f /tmp/DSH-Client-arm64.dmg
-```
-
-回滚只删除客户端文件和分区，不删除 `.13` 的 DSH 数据、凭据或会话。
+关闭客户端，保留失败 APP 供检查，恢复安装前留存的旧 APP 后 open。只删除经过核实的客户端路径；不删除 .dsh、worker Profile、凭据或会话。具体安装版本、哈希、PID 和结果见 DSH 主仓验收记录。

@@ -1,44 +1,20 @@
-# Local macOS
+# 本机 macOS 开发与验收
 
-## Prerequisites
-
-```bash
-node --version
-pnpm --version
-rustc --version
-xcode-select -p
-```
-
-Rust 缺失时安装官方 stable toolchain：
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-```
-
-## Verify
+需要 Node 22+、pnpm、Rust stable、Xcode Command Line Tools；macOS 最低 14。
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm test
 pnpm typecheck
 pnpm build
-cargo check --manifest-path src-tauri/Cargo.toml
-```
-
-## Run
-
-```bash
+source "$HOME/.cargo/env"
+cargo test --manifest-path src-tauri/Cargo.toml --lib
 pnpm tauri dev
+pnpm tauri build --target aarch64-apple-darwin --bundles app --no-sign
 ```
 
-添加 direct 连接时使用本机 DSH Web URL，例如 `http://127.0.0.1:3080/`。首次打开根页面粘贴当前进程打印的 token。添加 SSH-forward 连接时填写 `~/.ssh/config` 中的 Host 别名和远端 DSH 端口，客户端会启动本机 loopback 随机端口转发。
+测试连接地址 http://127.0.0.1:3080/。先保存不带凭据的根 URL，再在连接条目的密码输入框粘贴一次性 token 字符串并打开；首次登录应显示完整 DeepSeek Harness 工作区与会话界面。仅看到 401 只证明认证栅栏存在，不能认定登录或 WebSocket 已通。
 
-## Build test artifact
+验收至少包含一次最小对话、无 token 重新打开（Cookie）、两个连接的隔离、SSH 连通、窗口关闭和退出回收。登录后当前地址不得残留 token。不要把浏览器预览页当作原生客户端测试。
 
-```bash
-pnpm tauri build --target aarch64-apple-darwin
-shasum -a 256 src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
-```
-
-未签名测试包可能触发 Gatekeeper；只对本地个人测试使用，必要时在 Finder 中右键打开或移除文件 quarantine。不要把未签名包当作发布产物。
+macOS DMG 打包器曾因 Finder AppleEvent 超时失败；本轮使用 --bundles app + ditto ZIP，不依赖 Finder 安装。不要从未签名测试包宣称已完成签名/公证发布。

@@ -1,45 +1,51 @@
 # DSH Client
 
-DSH Client 是一个纯客户端壳，连接已经运行的 DSH Web Host。它不安装、不启动、不升级 DSH，也不承载 Agent 执行过程。
+连接已运行 DSH Web Host 的纯客户端。客户端不安装、启动或托管 DSH，不打包 Node、执行体、Provider 配置或私钥。
 
-## 当前范围
+## 当前交付状态
 
-- macOS、Windows、Linux 桌面：每个连接一个独立 WebView 窗口。
-- Android：连接列表与当前 WebView；SSH-forward 需要设备已有 VPN/direct HTTPS，首版不伪造系统 SSH。
-- direct：加载已有 HTTPS/域名入口。
-- ssh-forward：复用系统 OpenSSH 和 `~/.ssh/config` 的 Host 别名，将目标 `127.0.0.1:<remotePort>` 转发到本机随机 loopback 端口。
-- 首次打开时用户在 DSH 根页面粘贴启动 token；token 和 Basic Auth 不写入客户端配置。WebView 按连接持久化 Cookie，删除连接才清理分区。
+| 平台 | 状态 |
+| --- | --- |
+| macOS 14+ arm64 | 已构建未签名 APP；本机已验证 token 登录、完整界面；`.13` 用户目录安装测试 |
+| Windows / Linux | 共享桌面实现已编写，尚未完成目标机构建与实机验收 |
+| Android | 架构目标；专用原生容器、按连接存储隔离和 APK 尚未实现，不能作为可用移动版发布 |
 
-## 开发
+桌面 v1 为连接列表 + 每连接独立窗口。单窗口真标签不属于本轮验收。
+
+## 使用
+
+1. 新建连接，填写名称。
+2. HTTPS/Web：输入已有 HTTPS 域名或本机 `127.0.0.1:3080`。保存地址不能含 token、密码、查询参数、片段或反代子路径。非本机 HTTP 被拒绝。
+3. SSH 转发：选择 `~/.ssh/config`、`~/.ssh/dsh-fleet-config` 或不读取配置，填写 Host 别名、可选用户和目标 DSH 端口（默认 3080）。转发目标固定为远端 `127.0.0.1`。系统 OpenSSH 必须已能通过密钥无交互登录，主机指纹须在终端预先核对。
+4. 首次连接，在左侧该连接的“一次性 token”框粘贴 **token 字符串**，然后“打开 / 重试”。不粘贴完整 URL。输入会清空，连接配置不保存 token；系统 WebView 保存认证 Cookie。
+5. 之后打开时 token 留空即可。认证失效时重新填 token。编辑后保存会关闭旧连接窗口，下一次打开采用新配置。
+6. 删除连接会关闭窗口、停止 SSH，并请求系统异步清除该分区浏览数据；系统 API 不提供同步完成保证，删除后不复用旧分区 ID。
+
+SSH 本地端口按连接 ID 稳定分配在 40000–59999，以保留同一 origin 的 LocalStorage；端口占用时拒绝打开，避免加载已有的陌生服务。它不是任意 shell 命令入口，不接受任意 SSH 参数/配置路径。服务专用 key 不一定允许转发；`.13` 已验证“不读取配置 + 10.250.0.13 + zcj123v”的普通用户密钥路径。
+
+## 开发与验证
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm dev                 # 浏览器壳
-pnpm tauri dev           # Tauri 桌面壳
 pnpm test
 pnpm typecheck
 pnpm build
 source "$HOME/.cargo/env"
-cargo check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml --lib
+pnpm tauri dev
 ```
 
-前置：Node.js 22+、pnpm、Rust stable；macOS 构建需要 Xcode Command Line Tools。Android 还需要 Android Studio/SDK/NDK，执行 `pnpm tauri android init` 后再构建。
+前置：Node.js 22+、pnpm、Rust stable；macOS 需要 Xcode Command Line Tools。仅安装 Tauri CLI 不代表已完成 Android/Windows/Linux 工具链和构建。
 
-## 构建
+## macOS 测试产物
 
 ```bash
-pnpm tauri build --target aarch64-apple-darwin
-pnpm tauri build --target x86_64-pc-windows-msvc
-pnpm tauri build --target x86_64-unknown-linux-gnu
+pnpm tauri build --target aarch64-apple-darwin --bundles app --no-sign
+ditto -c -k --sequesterRsrc --keepParent 'src-tauri/target/aarch64-apple-darwin/release/bundle/macos/DSH Client.app' DSH-Client-arm64.zip
+shasum -a 256 DSH-Client-arm64.zip
 ```
 
-本轮测试版不签名、不公证、不注册自启。发布前另行配置代码签名、公证、Windows Authenticode 和 Linux 仓库产物。
-
-## 安全边界
-
-远端页面不获得 Tauri IPC；外部链接交给系统浏览器。SSH 参数始终以参数数组传给 `ssh`，不拼接 shell。客户端配置只保存连接元数据和分区 ID，不保存 Provider token、SSH 私钥、DSH_HOME、Session 数据库或 Fleet secret。
-
-详见：
+测试包未签名/公证，不注册自启。当前系统 Finder AppleScript 打包 DMG 曾超时，APP + ZIP 是本轮可验证分发路径。目标系统实际构建命令和产物须在该平台验证后再发布。
 
 - [架构](docs/architecture.md)
 - [安全](docs/security.md)

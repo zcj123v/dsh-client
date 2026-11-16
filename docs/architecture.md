@@ -1,36 +1,29 @@
-# Architecture
+# 架构
 
-## Components
+本地 React 壳负责连接列表、一次性认证输入、连接元数据和打开状态。Rust command 负责校验来源、系统 OpenSSH、就绪探测和 WebView 生命周期。目标节点提供全部 DSH Web、RPC、WebSocket、会话和执行环境。
 
-```text
-Shell UI (React)
-  ├─ ConnectionStore: local metadata only
-  ├─ ConnectionManager: URL/state/port/reconnect boundary
-  └─ WebviewWindow per connection
-       ├─ direct: existing HTTPS/host entry
-       └─ ssh-forward: local loopback -> OpenSSH -> remote 127.0.0.1:3080
-```
+## 连接与原生边界
 
-DSH Web UI、Client Connection、RPC、WebSocket、会话和插件均由目标节点提供。客户端不实现 `/api/remote.mux`，不复刻 DSH session API，也不使用 Fleet Bridge 代理普通对话。
+持久化字段采用白名单：id/name/mode/url、sshProfile/sshUser/sshConfig、remotePort、partition、createdAt/lastOpenedAt。认证正文不属于连接记录；无效或含凭据的历史记录在恢复时丢弃。
 
-## Connection record
+仅本地 main 窗口拥有 Tauri capability。原生 command 再检查调用窗口 label 和 origin。远端 dsh-* 窗口没有 capability，不允许导航到本地壳 origin。
 
-```text
-id, name, mode, url?
-sshProfile?, sshUser?, remoteHost?, remotePort
-partition, createdAt, lastOpenedAt?
-```
+## 窗口与存储
 
-`partition` 只用于 WebView 存储隔离。token、Cookie、Basic Auth 和私钥不属于记录。
+macOS 14+ 使用连接 ID SHA-256 的前 16 字节作为 WKWebView data store 标识；Windows/Linux 使用独立 data directory。不同连接拥有不同 Cookie/LocalStorage 容器。退出保留数据；删除连接请求系统异步清理，随后废弃 ID。系统清理 API 无同步完成保证。
 
-## Direct
+Android 当前尚无原生工程和 per-connection 容器；Tauri Android 不支持 data_directory/data_store_identifier，不能直接复用桌面隔离方案。需要独立 Activity/进程或原生 WebView profile 方案后才能发布。
 
-direct 只接受 `http://` 或 `https://` URL，v1 默认要求已有 HTTPS/域名入口。当前 DSH 节点不因客户端而改成非 loopback 监听。访问受目标 DSH 自身的 Host/Origin 栅栏和 token-to-cookie 认证保护。
+## SSH 转发
 
-## SSH-forward
+Rust 独立校验 Host/用户/端口；系统 ssh 使用参数数组、BatchMode、StrictHostKeyChecking、ExitOnForwardFailure 和保活。配置选择只允许系统默认、~/.ssh/dsh-fleet-config 或显式不读取配置（Unix /dev/null、Windows NUL）。目标始终为远端 loopback。
 
-桌面端从系统 SSH 配置读取 Host 别名、跳板、代理和 known_hosts。Rust 端只接收已经拆分好的参数数组，固定参数包括 `-N`、`ExitOnForwardFailure=yes`、心跳和 `-L 127.0.0.1:<local>:127.0.0.1:<remote>`。客户端退出时清理所有子进程。
+端口按 ID 稳定选取，先检查可绑定再启动 ssh；绑定移交存在 OS/OpenSSH 固有的极短竞争窗口，转发失败会回收子进程，不降级到其他服务。HTTP 就绪探测只是传输可达性，预登录 401/403 不等于认证成功；404/502 等不能通过探测。
 
-## v1 multi-window
+SSH 在 spawn 时就进入待清理注册表。窗口销毁、删除连接、打开失败和最终退出均 kill/wait。连接期间退出同样清理 pending 进程。重连由用户关闭旧窗口后重新打开，DSH 页面的 RPC/WS 自动重连沿用目标上游行为；尚未实现客户端自动重建隧道的退避循环。
 
-桌面 v1 每个连接使用稳定的 Tauri `WebviewWindow`，连接列表承担标签/窗口入口；同一窗口内真标签留到后续 multiwebview 阶段。Android 使用连接列表+当前 WebView。不同连接使用独立分区，删除连接时由后续平台适配清理对应分区。
+## 认证与导航
+
+一次性 token 只参与本次根 URL 导航，加载完成后移除当前历史项中的 token 查询参数。不保存到连接记录、不输出到日志。已有 Cookie 用于后续打开。HTTPS 依赖系统 WebView 的信任链和名称校验，不绕过自签名/过期/不匹配证书，不提供自定义证书 pinning。
+
+主导航限制为当前 origin；外链通过系统浏览器，含明显凭据参数或非 HTTP(S) 的跳转拒绝。相同 origin 的 popup 转到当前窗口，复杂 OAuth/popup 流程仍需实机兼容验证。
