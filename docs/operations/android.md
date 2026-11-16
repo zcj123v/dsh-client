@@ -92,3 +92,24 @@ adb -s "$SERIAL" shell am instrument -w -e tlsFixtureUrl https://localhost:4448/
 adb -s "$SERIAL" reverse --remove tcp:4448
 # Ctrl-C停止临时Python服务器；无需导入证书或改任何DSH节点
 ```
+
+
+## 0.2.2 附件入口与跨进程删除验收（2026-11-16）
+
+本轮仅增加测试和运行脚本，未改产品行为、不升版本。API36/SystemWebView133使用实际DshContentActivity、生产WebChromeClient和onActivityResult，测试脚本触屏点击真实HTML文件控件；仅以Instrumentation monitor替代外部ACTION_OPEN_DOCUMENT选择器返回，content URI来自测试APK固定假文件提供器。测试网页通过File.text读取文件名和精确字节，另覆盖取消后重选、拒绝file URI后重选。3项通过。这证明客户端选择/读取链路，**不代表DSH服务端已接收附件**，不替代用户真机系统选择器操作。
+
+测试提供器仅位于androidTest APK，纯Java，不依赖测试独立进程缺失的Kotlin运行时；只允许读固定合成fixture.txt，绝不暴露用户文件。最初管道夹具缺少可定位长度，Chromium无法读取，换为测试APK自身缓存假文件后通过。测试页等待按专用URL过滤，原生选择器monitor需匹配OPENABLE和MIME，脚本click不作有效用户手势证据。
+
+两段删除测试使用随机UUID和不同应用进程：prepare在加载的Profile写假Cookie/LocalStorage后调用持久删除标记/cleanup，确认已加载Profile不能本进程删除、标记仍在；force-stop后verify在任何Profile加载前执行与MainActivity相同的cleanup，确认标记消失、ProfileStore不再列出该Profile。两段各1项通过，证明延后删除生命周期，**不承诺底层物理同步擦除**。
+
+构建安装主APK与testAPK后，在明确指定的专用设备执行：
+
+```bash
+python3 tests/android-instrumentation.py --serial emulator-5580 --suite all
+# 已按上节启动临时自签名HTTPS探针并adb reverse后，含TLS用：
+python3 tests/android-instrumentation.py --serial emulator-5580 --suite all --tls-fixture-url https://localhost:4448/
+```
+
+无TLS参数会明确提示该用例跳过，不能用JUnit总数推断实际执行数；有探针时普通9项全部实际执行（6隔离/状态/TLS+3附件），随后另跑prepare/verify各1项。runner同时检查进程退出码和JUnit文本（am instrument即使测试失败也可能exit0）。两段删除会force-stop所选设备的客户端，因此只用于专用测试设备，不能指向个人在用客户端。
+
+本机最终9+1+1通过，前端14/Rust12/typecheck/build同时通过；独立只读审查household-newapi/gpt-6.1-sol无阻断。真实DSH附件上传/下载、macOS选择器及个人真机仍需后续验收。

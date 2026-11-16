@@ -1,0 +1,9 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Test APK only: fixed synthetic attachment, never exposes target-app files. -->
+        <provider android:name="com.zcj.dshclient.AttachmentFixtureProvider"
+            android:authorities="com.zcj.dshclient.test.attachment"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+    </application>
+</manifest>
