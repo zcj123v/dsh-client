@@ -15,7 +15,7 @@ ssh -F ~/.ssh/dsh-fleet-config dsh-air 'shasum -a 256 /tmp/DSH-Client-arm64.zip'
 
 ## 用户测试步骤
 
-1. 新建 HTTPS/Web 连接：名称“.13 本机”，地址 127.0.0.1:3080；保存。
+1. 新建 HTTPS/Web 连接：名称“.13 本机”，地址 `http://127.0.0.1:3080/`（必须包含协议）；保存。
 2. 在左侧这条连接的一次性 token 框粘贴当前 worker 的 token **字符串**，点“打开 / 重试”。认证失效后重复此步，不把 ?token= URL 保存为地址。
 3. 查看工作区/会话和模型选择，发一条最小消息，确认回复持续更新。关闭连接窗口再空 token 打开，确认 Cookie 恢复。
 4. 新建 SSH 转发：选择正确 SSH 配置、Host 别名、用户与远端端口。先用终端确认该 Host 可非交互公钥登录且已确认指纹。dsh-service 受限 key 若不允许转发，需要普通用户转发权限。
