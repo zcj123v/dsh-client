@@ -30,6 +30,7 @@ class DshContentActivity : AppCompatActivity() {
     private lateinit var body: LinearLayout
     private lateinit var status: TextView
     private var fileCallback: ValueCallback<Array<Uri>>? = null
+    private var navigationFailed = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -39,7 +40,7 @@ class DshContentActivity : AppCompatActivity() {
         bar.addView(Button(this).apply { text = "连接列表"; setOnClickListener { finish() } })
         bar.addView(Button(this).apply { text = "重新加载"; setOnClickListener { if (baseUrl.isNotEmpty()) web?.loadUrl(baseUrl) } })
         root.addView(bar)
-        status = TextView(this).apply { setPadding(16, 8, 16, 8) }
+        status = TextView(this).apply { setPadding(16, 8, 16, 8); accessibilityLiveRegion = android.view.View.ACCESSIBILITY_LIVE_REGION_POLITE }
         root.addView(status)
         body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -106,25 +107,25 @@ class DshContentActivity : AppCompatActivity() {
                     }
                     return true
                 }
-                override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) { status.text = "$titleText · 正在加载" }
+                override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) { navigationFailed = false; status.text = "$titleText · 正在加载" }
                 override fun onPageFinished(view: WebView, url: String) {
                     if (ContentPolicy.sameOrigin(baseUrl, url)) {
                         view.evaluateJavascript("history.replaceState(null, '', location.pathname + location.hash)", null)
                         view.clearHistory()
                         WebViewCompat.getProfile(view).cookieManager.flush()
-                        status.text = "$titleText · 登录状态见 DSH 页面"
+                        if (!navigationFailed) status.text = "$titleText · 登录状态见 DSH 页面"
                     }
                 }
                 override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
                     handler.cancel()
-                    message("TLS 证书验证失败；请检查目标证书，不提供忽略错误入口")
+                    failure("TLS 证书验证失败；请检查目标证书，不提供忽略错误入口")
                 }
                 override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
-                    if (request.isForMainFrame) message("连接失败，请检查网络或回到连接列表重试")
+                    if (request.isForMainFrame) failure(if (error.errorCode == ERROR_FAILED_SSL_HANDSHAKE) "TLS 连接失败；请检查证书、系统时间和目标配置" else "连接失败，请检查网络或回到连接列表重试")
                 }
                 override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
                     if (request.isForMainFrame && response.statusCode >= 400) {
-                        status.text = if (response.statusCode == 401 || response.statusCode == 403) "认证未通过：返回连接列表填写当前 token" else "服务器错误：HTTP ${response.statusCode}"
+                        failure(if (response.statusCode == 401 || response.statusCode == 403) "认证未通过：返回连接列表填写当前 token" else "服务器错误：HTTP ${response.statusCode}")
                     }
                 }
                 override fun onReceivedHttpAuthRequest(view: WebView, handler: HttpAuthHandler, host: String, realm: String) {
@@ -167,6 +168,7 @@ class DshContentActivity : AppCompatActivity() {
         fileCallback?.onReceiveValue(uris.toTypedArray().takeIf { it.isNotEmpty() })
         fileCallback = null
     }
+    private fun failure(text: String) { navigationFailed = true; message(text) }
     private fun message(text: String) { if (::status.isInitialized) status.text = text }
     private fun destroyWeb() {
         fileCallback?.onReceiveValue(null); fileCallback = null

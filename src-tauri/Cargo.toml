@@ -1,6 +1,6 @@
 [package]
 name = "dsh-client"
-version = "0.2.1"
+version = "0.2.2"
 description = "Cross-platform client shell for running DSH Web Hosts"
 authors = ["zcj123v"]
 edition = "2024"

@@ -71,3 +71,24 @@ adb shell am instrument -w com.zcj.dshclient.test/androidx.test.runner.AndroidJU
 源码 `ec91d3c`，Android [CI43815786483](https://github.com/zcj123v/dsh-client/actions/runs/43815786483) 与三桌面 [CI43815786494](https://github.com/zcj123v/dsh-client/actions/runs/43815786494) 全成功。实际本机构建APK versionCode2000/versionName0.2.0/minSdk24/target36/arm64-v8a，SHA-256 `7a08aa1c389de89017c800830f7be8f5c675629cfa414c7cf502f5b25033c744`；3项仪器测试包含恢复Bundle无假token的断言，最终重跑通过。
 
 Actions artifact 只保留14天；debug签名依赖构建机，Android同包名不同debug签名不能覆盖安装。换机器产物时先确认签名；卸载会删除客户端连接与登录数据，必须由测试者自行决定后操作。CI下载物与本机APK不保证字节相同，均按各自产物SHA256核对。
+
+
+## 0.2.2 认证/网络/TLS 错误状态
+
+每次主页面导航开始时重置失败状态；HTTP401/403、网络或TLS失败后，onPageFinished只做历史/存储处理，不把失败覆盖成普通页面状态。下次主动重新加载后可恢复正常显示。状态TextView使用读屏live region；不显示服务器响应体、系统原始错误或token。
+
+API36/System WebView133仪器测试新增认证错误保持与重试、真实`.invalid`DNS失败。两个新增测试先红后绿；另用临时loopback自签名TLS服务实际触发onReceivedSslError，确认cancel、错误不被finished覆盖，且页面内容未执行。证书只用于测试，不导入信任库，不增加自签名例外。含TLS探针的运行共6项通过；无tlsFixtureUrl参数时明确跳过该项，普通5项仍运行。
+
+可重复TLS测试（先按上文构建/安装主APK和测试APK；以下证书只在临时目录生成）：
+
+```bash
+TLS_TEST_DIR=$(mktemp -d /tmp/dsh-client-tls.XXXXXX)
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TLS_TEST_DIR/key.pem" -out "$TLS_TEST_DIR/cert.pem" -days 1 -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+chmod 600 "$TLS_TEST_DIR/key.pem"
+python3 tests/android-tls-fixture.py --cert "$TLS_TEST_DIR/cert.pem" --key "$TLS_TEST_DIR/key.pem" --port 4448
+# 另一个终端；SERIAL填写专用测试设备，不要默认操作个人设备
+adb -s "$SERIAL" reverse tcp:4448 tcp:4448
+adb -s "$SERIAL" shell am instrument -w -e tlsFixtureUrl https://localhost:4448/ com.zcj.dshclient.test/androidx.test.runner.AndroidJUnitRunner
+adb -s "$SERIAL" reverse --remove tcp:4448
+# Ctrl-C停止临时Python服务器；无需导入证书或改任何DSH节点
+```

@@ -100,6 +100,123 @@ class ProfileIsolationTest {
         return (0 until view.childCount).sumOf { webViews(view.getChildAt(it)) }
     }
     @Test
+    fun authenticationFailureRemainsVisibleAfterPageFinishedAndResetsOnRetry() {
+        withContentView { activity, view ->
+            val client = view.webViewClient
+            val root = "https://dsh-client-test.invalid/"
+            client.onPageStarted(view, root, null)
+            val request = mainRequest(root)
+            client.onReceivedHttpError(view, request, android.webkit.WebResourceResponse("text/html", "UTF-8", 401, "Unauthorized", emptyMap(), "denied".byteInputStream()))
+            client.onPageFinished(view, root)
+            assertTrue("401 must remain visible after finish", texts(activity.window.decorView).any { it.contains("认证未通过") })
+            client.onPageStarted(view, root, null)
+            client.onPageFinished(view, root)
+            assertTrue("retry success clears previous failure", texts(activity.window.decorView).any { it.contains("登录状态见 DSH 页面") })
+        }
+    }
+    @Test
+    fun actualNetworkFailureCannotBeOverwrittenByPageFinished() {
+        val id = UUID.randomUUID().toString()
+        val root = "https://dsh-client-network-failure.invalid/"
+        instrumentation.runOnMainSync { ContentRequests.put(id, ContentRequest("Network failure", root)) }
+        val intent = android.content.Intent(context, DshContentActivity::class.java).putExtra("connectionId", id)
+        val scenario = androidx.test.core.app.ActivityScenario.launch<DshContentActivity>(intent)
+        val ready = CountDownLatch(1)
+        try {
+            scenario.onActivity { activity ->
+                val view = locateWebView(activity.window.decorView)!!
+                view.stopLoading()
+                val actual = view.webViewClient
+                view.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(v: WebView, url: String, favicon: android.graphics.Bitmap?) { actual.onPageStarted(v, url, favicon) }
+                    override fun onReceivedError(v: WebView, request: android.webkit.WebResourceRequest, error: android.webkit.WebResourceError) { actual.onReceivedError(v, request, error) }
+                    override fun onPageFinished(v: WebView, url: String) { actual.onPageFinished(v, url); ready.countDown() }
+                }
+                view.loadUrl(root)
+            }
+            assertTrue("failed network navigation finished", ready.await(30, TimeUnit.SECONDS))
+            scenario.onActivity { activity ->
+                val visible = texts(activity.window.decorView)
+                assertTrue("network failure remains visible", visible.any { it.contains("连接失败") })
+                assertFalse(visible.any { it.contains("登录状态见 DSH 页面") })
+            }
+        } finally {
+            scenario.close()
+            instrumentation.runOnMainSync { PendingProfiles.mark(context, id) }
+        }
+    }
+    @Test
+    fun actualUntrustedTlsCertificateIsCancelledAndFailureRemainsVisible() {
+        val root = InstrumentationRegistry.getArguments().getString("tlsFixtureUrl")
+        org.junit.Assume.assumeNotNull(root)
+        val target = root!!
+        assertTrue("TLS fixture is loopback only", target.startsWith("https://localhost:") || target.startsWith("https://127.0.0.1:"))
+        val id = UUID.randomUUID().toString()
+        instrumentation.runOnMainSync { ContentRequests.put(id, ContentRequest("TLS fixture", target)) }
+        val intent = android.content.Intent(context, DshContentActivity::class.java).putExtra("connectionId", id)
+        val scenario = androidx.test.core.app.ActivityScenario.launch<DshContentActivity>(intent)
+        val rejected = CountDownLatch(1)
+        lateinit var currentView: WebView
+        try {
+            scenario.onActivity { activity ->
+                currentView = locateWebView(activity.window.decorView)!!
+                currentView.stopLoading()
+                val actual = currentView.webViewClient
+                currentView.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(v: WebView, url: String, favicon: android.graphics.Bitmap?) { actual.onPageStarted(v, url, favicon) }
+                    override fun onReceivedSslError(v: WebView, handler: android.webkit.SslErrorHandler, error: android.net.http.SslError) {
+                        actual.onReceivedSslError(v, handler, error)
+                        // Exercise a late finish callback too, regardless of the engine's error-page ordering.
+                        actual.onPageFinished(v, target)
+                        rejected.countDown()
+                    }
+                    override fun onPageFinished(v: WebView, url: String) { actual.onPageFinished(v, url) }
+                }
+                currentView.loadUrl(target)
+            }
+            assertTrue("System WebView delivered certificate rejection", rejected.await(30, TimeUnit.SECONDS))
+            scenario.onActivity { activity -> assertTrue(texts(activity.window.decorView).any { it.contains("TLS 证书验证失败") }) }
+            assertFalse("untrusted TLS page must not execute", evaluate(currentView, "document.body?.textContent || ''").contains("TLS_FIXTURE_MUST_NOT_LOAD"))
+        } finally {
+            scenario.close()
+            instrumentation.runOnMainSync { PendingProfiles.mark(context, id) }
+        }
+    }
+    private fun mainRequest(root: String) = object : android.webkit.WebResourceRequest {
+        override fun getUrl() = android.net.Uri.parse(root)
+        override fun isForMainFrame() = true
+        override fun isRedirect() = false
+        override fun hasGesture() = false
+        override fun getMethod() = "GET"
+        override fun getRequestHeaders(): MutableMap<String, String> = mutableMapOf()
+    }
+    private fun withContentView(check: (DshContentActivity, WebView) -> Unit) {
+        val id = UUID.randomUUID().toString()
+        instrumentation.runOnMainSync { ContentRequests.put(id, ContentRequest("Failure test", "https://dsh-client-test.invalid/")) }
+        val intent = android.content.Intent(context, DshContentActivity::class.java).putExtra("connectionId", id)
+        val scenario = androidx.test.core.app.ActivityScenario.launch<DshContentActivity>(intent)
+        try {
+            scenario.onActivity { activity ->
+                val view = locateWebView(activity.window.decorView)!!
+                view.stopLoading()
+                check(activity, view)
+            }
+        } finally {
+            scenario.close()
+            instrumentation.runOnMainSync { PendingProfiles.mark(context, id) }
+        }
+    }
+    private fun locateWebView(node: android.view.View): WebView? {
+        if (node is WebView) return node
+        if (node is android.view.ViewGroup) for (i in 0 until node.childCount) locateWebView(node.getChildAt(i))?.let { return it }
+        return null
+    }
+    private fun texts(node: android.view.View): List<String> {
+        if (node is android.widget.TextView) return listOf(node.text.toString())
+        if (node !is android.view.ViewGroup) return emptyList()
+        return (0 until node.childCount).flatMap { texts(node.getChildAt(it)) }
+    }
+    @Test
     fun contentActivityIsPrivateAndApplicationBackupIsDisabled() {
         val component = ComponentName(context, DshContentActivity::class.java)
         val info = context.packageManager.getActivityInfo(component, 0)
