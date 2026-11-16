@@ -57,3 +57,6 @@ shasum -a 256 DSH-Client-arm64.zip
 - 桌面 CI：`.github/workflows/desktop.yml`，三平台原生 runner，依次安装依赖、运行测试、构建安装包并上传 Actions artifact（14天）。Windows 需要 WebView2 Runtime、系统 OpenSSH；Linux 需要 WebKitGTK 4.1，发行版依赖见生成 DEB。
 - Android CI：`.github/workflows/android.yml`，构建 arm64 debug 主 APK 和设备测试 APK，不自动安装到个人设备；[Android 原生容器与验收](docs/operations/android.md)。
 - 2026-11-16 首轮 [CI 43808066571](https://github.com/zcj123v/dsh-client/actions/runs/43808066571)：Windows/Linux 两个 job 成功并已收集产物；macOS 旧 runner 镜像被 GitHub 拒绝，已改用 macos-latest，本机 arm64 构建和实测仍有效。
+
+
+当前0.2.0源码已合入main（`ec91d3c`），最终 [Android构建](https://github.com/zcj123v/dsh-client/actions/runs/43815786483) 和 [三桌面构建](https://github.com/zcj123v/dsh-client/actions/runs/43815786494) 全成功。Android API36模拟器3项仪器测试、真实本地壳→原生内容调用/无IPC、删除标记重启清理均已验证。`.13`暂保留已安装0.1.1供现场测试，构建新版本不代表已更新该机器。

@@ -64,3 +64,10 @@ adb shell am instrument -w com.zcj.dshclient.test/androidx.test.runner.AndroidJU
 本机专用模拟器 emulator-5580：arm64/API36，System WebView 133.0.6943.137。3项仪器测试初跑中 Activity 重建红（重建后视图0），修复后全部通过；前端13测试和Rust7测试通过，Java URL边界16检查通过。
 
 从实际 Tauri 主界面启动（http://tauri.localhost），标题和连接列表正确、SSH入口隐藏；通过原生 open_connection 命令打开私有 DshContentActivity 并成功加载 https://example.com/；DevTools 检查远端 `typeof window.__TAURI_INTERNALS__` 为 undefined。调用删除后仅UUID墓碑持久化，force-stop/restart后墓碑集合为空。未将公共页面加载替代DSH认证/会话业务验收。
+
+
+## 0.2.0 构建固化
+
+源码 `ec91d3c`，Android [CI43815786483](https://github.com/zcj123v/dsh-client/actions/runs/43815786483) 与三桌面 [CI43815786494](https://github.com/zcj123v/dsh-client/actions/runs/43815786494) 全成功。实际本机构建APK versionCode2000/versionName0.2.0/minSdk24/target36/arm64-v8a，SHA-256 `7a08aa1c389de89017c800830f7be8f5c675629cfa414c7cf502f5b25033c744`；3项仪器测试包含恢复Bundle无假token的断言，最终重跑通过。
+
+Actions artifact 只保留14天；debug签名依赖构建机，Android同包名不同debug签名不能覆盖安装。换机器产物时先确认签名；卸载会删除客户端连接与登录数据，必须由测试者自行决定后操作。CI下载物与本机APK不保证字节相同，均按各自产物SHA256核对。
