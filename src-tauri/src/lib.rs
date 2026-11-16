@@ -1,5 +1,7 @@
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(not(target_os = "android"))]
+mod endpoints;
 mod policy;
 #[cfg(not(target_os = "android"))]
 mod recovery;
@@ -25,12 +27,14 @@ use tauri::{WebviewUrl, WebviewWindowBuilder};
 #[cfg(not(target_os = "android"))]
 use tauri_plugin_opener::OpenerExt;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Connection {
     id: String,
     name: String,
     mode: String,
+    #[cfg(not(target_os = "android"))]
+    endpoints: Option<Vec<endpoints::Endpoint>>,
     url: Option<String>,
     #[cfg(not(target_os = "android"))]
     ssh_profile: Option<String>,
@@ -67,6 +71,8 @@ struct Connections {
     tunnels: Mutex<HashMap<String, Arc<Mutex<Tunnel>>>>,
     exiting: AtomicBool,
     urls: Mutex<HashMap<String, tauri::Url>>,
+    selected_entries: Mutex<HashMap<String, usize>>,
+    opening_nodes: Mutex<std::collections::HashSet<String>>,
 }
 
 fn require_shell(window: &WebviewWindow) -> Result<(), String> {
@@ -153,7 +159,7 @@ fn register_tunnel(
 #[cfg(not(target_os = "android"))]
 fn ssh_ready(child: Arc<Mutex<Tunnel>>, port: u16) -> Result<(), String> {
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(12) {
+    while start.elapsed() < Duration::from_secs(5) {
         if child.lock().map(|t| t.stopped).unwrap_or(true) {
             return Err("连接已关闭".into());
         }
@@ -190,6 +196,130 @@ fn ssh_ready(child: Arc<Mutex<Tunnel>>, port: u16) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(150));
     }
     Err("SSH 转发未就绪：远端 DSH 端口没有响应；请检查端口或重试".into())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenNodeResult {
+    generation: u64,
+    endpoint_index: usize,
+}
+
+#[cfg(not(target_os = "android"))]
+struct OpeningNode {
+    app: tauri::AppHandle,
+    id: String,
+}
+#[cfg(not(target_os = "android"))]
+impl Drop for OpeningNode {
+    fn drop(&mut self) {
+        if let Ok(mut ids) = self.app.state::<Connections>().opening_nodes.lock() {
+            ids.remove(&self.id);
+        }
+    }
+}
+#[tauri::command]
+async fn open_node(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    record: Connection,
+    token: Option<String>,
+    request_id: String,
+) -> Result<OpenNodeResult, String> {
+    require_shell(&window)?;
+    connection_id(&request_id)?;
+    #[cfg(target_os = "android")]
+    {
+        return open_connection(window, app, record, token)
+            .await
+            .map(|generation| OpenNodeResult {
+                generation,
+                endpoint_index: 0,
+            });
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let entries = endpoints::validate_entries(&record)?;
+        // Validate before any transport side effects; never send the token during discovery.
+        login_url(
+            tauri::Url::parse("http://127.0.0.1/").unwrap(),
+            token.as_deref(),
+        )?;
+        {
+            let state = app.state::<Connections>();
+            let mut ids = state.opening_nodes.lock().map_err(|_| "节点状态不可用")?;
+            if !ids.insert(record.id.clone()) {
+                return Err("节点正在连接，请等待".into());
+            }
+        }
+        let _opening = OpeningNode {
+            app: app.clone(),
+            id: record.id.clone(),
+        };
+        if app
+            .get_webview_window(&format!("dsh-{}", record.id))
+            .is_some()
+        {
+            let index = app
+                .state::<Connections>()
+                .selected_entries
+                .lock()
+                .map_err(|_| "入口状态不可用")?
+                .get(&record.id)
+                .copied()
+                .ok_or("请关闭旧连接窗口后重试")?;
+            let entry = entries.get(index).ok_or("请保存修改并关闭旧窗口后重试")?;
+            let generation = open_connection(
+                window,
+                app.clone(),
+                entry.connection(&record.id, &record.name),
+                token,
+            )
+            .await?;
+            return Ok(OpenNodeResult {
+                generation,
+                endpoint_index: index,
+            });
+        }
+        let (index, generation) = endpoints::try_in_order(entries.len(), |index| {
+            let entry = entries[index].clone();
+            let window = window.clone();
+            let app = app.clone();
+            let token = token.clone();
+            let id = record.id.clone();
+            let name = record.name.clone();
+            let request_id = request_id.clone();
+            async move {
+                if app.state::<Connections>().exiting.load(Ordering::SeqCst) {
+                    return Err("客户端正在退出".into());
+                }
+                if let Some(shell) = app.get_webview_window("main") {
+                    let _ = shell.emit(
+                        "node-attempt",
+                        serde_json::json!({"id":id,"requestId":request_id,"index":index}),
+                    );
+                }
+                let probe = entry.clone();
+                tauri::async_runtime::spawn_blocking(move || probe.probe())
+                    .await
+                    .map_err(|_| "连接探测未完成")??;
+                if app.state::<Connections>().exiting.load(Ordering::SeqCst) {
+                    return Err("客户端正在退出".into());
+                }
+                open_connection(window, app, entry.connection(&id, &name), token).await
+            }
+        })
+        .await?;
+        app.state::<Connections>()
+            .selected_entries
+            .lock()
+            .map_err(|_| "入口状态不可用")?
+            .insert(record.id, index);
+        Ok(OpenNodeResult {
+            generation,
+            endpoint_index: index,
+        })
+    }
 }
 
 #[tauri::command]
@@ -562,6 +692,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            open_node,
             open_connection,
             delete_connection,
             close_connection

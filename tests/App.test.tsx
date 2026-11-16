@@ -4,8 +4,8 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { StrictMode } from 'react'
 
 const nativeEvents = vi.hoisted(() => ({ receive: undefined as undefined | ((event: { payload: unknown }) => void) }))
-vi.mock('@tauri-apps/api/core', () => ({ isTauri: () => true, invoke: async () => 100 }))
-vi.mock('@tauri-apps/api/event', () => ({ listen: async (_name: string, callback: (event: { payload: unknown }) => void) => { nativeEvents.receive = callback; return () => { nativeEvents.receive = undefined } } }))
+vi.mock('@tauri-apps/api/core', () => ({ isTauri: () => true, invoke: async () => ({ generation: 100, endpointIndex: 0 }) }))
+vi.mock('@tauri-apps/api/event', () => ({ listen: async (name: string, callback: (event: { payload: unknown }) => void) => { if (name === 'connection-status') nativeEvents.receive = callback; return () => { if (name === 'connection-status') nativeEvents.receive = undefined } } }))
 
 afterEach(cleanup)
 it('shows bounded native SSH recovery and failure without persisting lifecycle or error secrets', async () => {
@@ -26,6 +26,25 @@ it('shows bounded native SSH recovery and failure without persisting lifecycle o
   expect(document.body.textContent).not.toContain('NEVER_RENDER_SECRET')
   expect(localStorage.getItem('dsh-client.connections.v1')).not.toContain('reconnecting')
 })
+it('adds the local node once and keeps endpoint priority after moving and saving', async () => {
+  localStorage.clear(); vi.resetModules()
+  const { default: App } = await import('../src/App')
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: '添加本机 DSH' }))
+  fireEvent.click(screen.getByRole('button', { name: '添加本机 DSH' }))
+  expect(screen.getAllByRole('button', { name: '打开 / 重试' })).toHaveLength(1)
+  fireEvent.change(screen.getByLabelText('显示名称'), { target: { value: 'Air' } })
+  fireEvent.change(screen.getByLabelText('入口 1 名称'), { target: { value: 'LAN' } })
+  fireEvent.change(screen.getByLabelText('入口 1 DSH 地址'), { target: { value: 'https://lan.example.test/' } })
+  fireEvent.click(screen.getByRole('button', { name: '添加备用入口' }))
+  fireEvent.change(screen.getByLabelText('入口 2 名称'), { target: { value: 'WG' } })
+  fireEvent.change(screen.getByLabelText('入口 2 DSH 地址'), { target: { value: 'https://wg.example.test/' } })
+  fireEvent.click(screen.getByRole('button', { name: '上移入口 2' }))
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: '保存节点' })) })
+  const records = JSON.parse(localStorage.getItem('dsh-client.connections.v1')!)
+  expect(records.find((record: {name:string}) => record.name === 'Air').endpoints.map((e:{label:string})=>e.label)).toEqual(['WG','LAN'])
+})
+
 it('keeps the token input usable after React releases the input event and never saves it', async () => {
   localStorage.setItem('dsh-client.connections.v1', JSON.stringify([{ id:'170ce412-3cbb-4467-a35a-b49fce65e8ef', name:'Test', mode:'direct', url:'http://127.0.0.1:3080/', remotePort:3080, partition:'170ce412-3cbb-4467-a35a-b49fce65e8ef', createdAt:'2026-11-16T00:00:00Z' }]))
   vi.resetModules()

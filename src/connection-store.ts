@@ -29,10 +29,11 @@ export class ConnectionStore {
       }
     } catch { /* Start empty when storage is corrupt. */ }
   }
-  list(): ConnectionRecord[] { return this.records.map(record => ({ ...record })) }
+  list(): ConnectionRecord[] { return this.records.map(record => ({ ...record, ...(record.endpoints ? { endpoints: record.endpoints.map(endpoint => ({ ...endpoint })) } : {}) })) }
   save(record: ConnectionRecord): void {
     const clean = sanitizeRecord(record)
-    this.records = [...this.records.filter(item => item.id !== record.id), clean]
+    const index = this.records.findIndex(item => item.id === record.id)
+    this.records = index < 0 ? [...this.records, clean] : this.records.map((item, i) => i === index ? clean : item)
     this.persist()
   }
   remove(id: string): void {

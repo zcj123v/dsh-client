@@ -1,7 +1,13 @@
 export type ConnectionMode = 'direct' | 'ssh-forward'
 
+export interface Endpoint extends Omit<ConnectionDraft, 'name' | 'endpoints'> { label: string }
+export function connectionEndpoints(record: ConnectionDraft): Endpoint[] {
+  return record.endpoints?.map(entry => ({ ...entry })) ?? [{ label: '默认入口', mode: record.mode, url: record.url, sshConfig: record.sshConfig, sshProfile: record.sshProfile, sshUser: record.sshUser, remotePort: record.remotePort ?? 3080 }]
+}
+
 export interface ConnectionDraft {
   name: string
+  endpoints?: Endpoint[]
   mode: ConnectionMode
   url?: string
   sshConfig?: 'default' | 'fleet' | 'none'
@@ -14,6 +20,7 @@ export interface ConnectionDraft {
 export interface ConnectionRecord {
   id: string
   name: string
+  endpoints?: Endpoint[]
   mode: ConnectionMode
   url?: string
   sshConfig?: 'default' | 'fleet' | 'none'
@@ -50,6 +57,17 @@ export function normalizeConnectionUrl(value: string): string {
 
 export function createConnectionRecord(draft: ConnectionDraft, idFactory: () => string = () => crypto.randomUUID()): ConnectionRecord {
   const id = idFactory()
+  if (draft.endpoints !== undefined) {
+    if (!Array.isArray(draft.endpoints) || draft.endpoints.length < 1 || draft.endpoints.length > 8) throw new Error('每个节点需要 1–8 个入口')
+    const endpoints = draft.endpoints.map(entry => {
+      if (typeof entry.label !== 'string' || !entry.label.trim() || entry.label.length > 40) throw new Error('入口名称需要 1–40 个字符')
+      const clean = createConnectionRecord({ ...entry, name: draft.name, endpoints: undefined }, () => id)
+      const { mode, url, sshConfig, sshProfile, sshUser, remoteHost, remotePort } = clean
+      return { label: entry.label.trim(), mode, url, sshConfig, sshProfile, sshUser, remoteHost, remotePort }
+    })
+    return { ...createConnectionRecord({ ...endpoints[0]!, name: draft.name }, () => id), endpoints }
+  }
+  if (draft.mode !== 'direct' && draft.mode !== 'ssh-forward') throw new Error('连接模式无效')
   const name = draft.name.trim()
   if (!name) throw new Error('连接名称不能为空')
   if (draft.mode === 'direct') {

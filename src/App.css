@@ -52,4 +52,15 @@ h2 { margin-bottom: 0; font-size: 20px; letter-spacing: -.01em; }
 
 .connection-meta small { color: #8cac9f; font-size: 11px; }
 .connection-meta input, select { width: 100%; padding: 9px; border: 1px solid #3b4a4c; border-radius: 4px; background: #12191a; color: #eef2f4; font-size: 12px; }
-button:disabled { opacity: .5; cursor: wait; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+.local-shortcut { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 16px 24px; border-bottom: 1px solid #2b383a; }
+.local-shortcut small { color: #839a94; font-size: 11px; }
+.secondary-button, .endpoint-toolbar button { padding: 8px 12px; background: #1b302c; color: #b8e5d8; border: 1px solid #38594f; border-radius: 4px; font-size: 12px; }
+.endpoint-list { display: grid; gap: 16px; min-width: 0; }
+.endpoint-editor { display: grid; gap: 12px; min-width: 0; padding: 14px; margin: 0; border: 1px solid #3a4e49; border-radius: 5px; }
+.endpoint-editor legend { color: #a4d6c8; padding: 0 6px; font-size: 12px; font-weight: 700; }
+.endpoint-toolbar { display: flex; gap: 6px; justify-content: flex-end; }
+.endpoint-toolbar button { padding: 5px 8px; }
+.connection-meta .entry-chain { color: #a5d7c8; font: 12px/1.5 -apple-system, sans-serif; white-space: normal; }
+.connections-panel { align-self: start; position: sticky; top: 20px; }
+@media (max-width: 840px) { .connections-panel { position: static; } }

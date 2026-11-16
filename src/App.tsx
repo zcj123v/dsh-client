@@ -1,9 +1,10 @@
 import { invoke } from '@tauri-apps/api/core'
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import './App.css'
-import { createConnectionRecord, displayConnection, type ConnectionDraft, type ConnectionRecord } from './connection-model'
+import { connectionEndpoints, createConnectionRecord, displayConnection, type ConnectionDraft, type ConnectionRecord, type Endpoint } from './connection-model'
+import { EndpointEditor, blankEndpoint } from './EndpointEditor'
 import { ConnectionStore } from './connection-store'
 import { connectionCapabilities } from './platform-capabilities'
 
@@ -20,11 +21,14 @@ function App() {
   const capabilities = connectionCapabilities(navigator.userAgent)
   const [connections, setConnections] = useState<ConnectionRecord[]>(store.list())
   const [draft, setDraft] = useState<ConnectionDraft>(initialDraft)
+  const [entries, setEntries] = useState<Endpoint[]>([blankEndpoint()])
+  const [currentEntries, setCurrentEntries] = useState<Record<string, string>>({})
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [tokens, setTokens] = useState<Record<string, string>>({})
   const [statuses, setStatuses] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
+  const openingRequest = useRef<string | null>(null)
   const generations = useRef<Record<string, number | null>>({})
   const [editing, setEditing] = useState<ConnectionRecord | null>(null)
 
@@ -53,7 +57,20 @@ function App() {
     return () => { disposed = true; unlisten?.() }
   }, [])
 
-  const recent = useMemo(() => [...connections].sort((a, b) => (b.lastOpenedAt ?? '').localeCompare(a.lastOpenedAt ?? '')), [connections])
+  useEffect(() => {
+    if (!isTauri() || capabilities.android) return
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void listen<{ id: string; requestId: string; index: number }>('node-attempt', event => {
+      if (disposed || openingRequest.current !== event.payload?.requestId) return
+      const record = store.list().find(record => record.id === event.payload.id)
+      const entry = record && connectionEndpoints(record)[event.payload.index]
+      if (record && entry) setStatuses(current => ({ ...current, [record.id]: `正在尝试入口 ${event.payload.index + 1}：${entry.label}…` }))
+    }).then(stop => { if (disposed) stop(); else unlisten = stop }).catch(() => {})
+    return () => { disposed = true; unlisten?.() }
+  }, [capabilities.android])
+
+  const recent = connections
 
   function refresh(): void { setConnections(store.list()) }
 
@@ -62,13 +79,14 @@ function App() {
     setError('')
     setNotice('')
     try {
-      const record = createConnectionRecord(draft, editing ? () => editing.id : undefined)
-      if (capabilities.android && (record.mode !== 'direct' || !record.url?.startsWith('https://'))) throw new Error('Android 使用已有 HTTPS 入口，不支持 SSH 或本机 HTTP')
+      const record = createConnectionRecord({ ...draft, endpoints: entries }, editing ? () => editing.id : undefined)
+      if (capabilities.android && (connectionEndpoints(record).some(entry => entry.mode !== 'direct' || !entry.url?.startsWith('https://')))) throw new Error('Android 使用已有 HTTPS 入口，不支持 SSH 或本机 HTTP')
       if (editing) { record.createdAt = editing.createdAt; record.lastOpenedAt = editing.lastOpenedAt }
       if (editing && isTauri()) await invoke("close_connection", { id: editing.id })
       store.save(record)
       refresh()
       setDraft(initialDraft)
+      setEntries([blankEndpoint()])
       setEditing(null)
       setNotice('连接已保存')
     } catch (reason) {
@@ -79,6 +97,7 @@ function App() {
   async function openConnection(record: ConnectionRecord): Promise<void> {
     if (busy) return
     setBusy(true)
+    openingRequest.current = crypto.randomUUID()
     setError('')
     setNotice('')
     const token = tokens[record.id]?.trim() || null
@@ -87,15 +106,18 @@ function App() {
     setStatuses(current => ({ ...current, [record.id]: '正在连接…' }))
     try {
       if (!isTauri()) throw new Error('请在 DSH Client 应用中打开连接；浏览器页面仅用于预览')
-      const generation = await invoke<number>('open_connection', { record, token })
-      generations.current[record.id] = generation
+      const result = capabilities.android
+        ? { generation: await invoke<number>('open_connection', { record, token }), endpointIndex: 0 }
+        : await invoke<{ generation: number; endpointIndex: number }>('open_node', { record, token, requestId: openingRequest.current })
+      generations.current[record.id] = result.generation
+      setCurrentEntries(current => ({ ...current, [record.id]: connectionEndpoints(record)[result.endpointIndex]?.label ?? '默认入口' }))
       store.markOpened(record.id)
       refresh()
       setStatuses(current => ({ ...current, [record.id]: '窗口已打开 · 登录状态见 DSH 页面' }))
     } catch (reason) {
       setStatuses(current => ({ ...current, [record.id]: '连接失败，可重试' }))
       setError(typeof reason === 'string' ? reason : reason instanceof Error ? reason.message : '连接失败')
-    } finally { setBusy(false) }
+    } finally { openingRequest.current = null; setBusy(false) }
   }
 
   async function removeConnection(record: ConnectionRecord): Promise<void> {
@@ -113,9 +135,18 @@ function App() {
     finally { setBusy(false) }
   }
 
+  function addLocal(): void {
+    if (busy) return
+    const existing = store.list().find(record => connectionEndpoints(record).some(entry => entry.mode === 'direct' && entry.url === 'http://127.0.0.1:3080/'))
+    if (existing) { setNotice(`本机节点已存在：${existing.name}`); return }
+    store.save(createConnectionRecord({ name: '本机 DSH', mode: 'direct', endpoints: [{ label: '本机', mode: 'direct', url: 'http://127.0.0.1:3080/' }] }))
+    refresh(); setError(''); setNotice('已添加本机 DSH；默认端口 3080，可点编辑修改')
+  }
+
   function editConnection(record: ConnectionRecord): void {
     setEditing(record)
     setDraft({ ...record })
+    setEntries(connectionEndpoints(record))
   }
 
   return (
@@ -132,15 +163,18 @@ function App() {
       <section className="workspace-grid">
         <section className="panel connections-panel">
           <div className="panel-heading">
-            <div><p className="section-kicker">WORKSPACES</p><h2>已保存连接</h2></div>
+            <div><p className="section-kicker">WORKSPACES</p><h2>已保存节点</h2></div>
             <span className="count-badge">{connections.length}</span>
           </div>
+          {!capabilities.android && <div className="local-shortcut"><button disabled={busy} className="secondary-button" onClick={addLocal}>添加本机 DSH</button><small>127.0.0.1:3080 · 不启动服务</small></div>}
           {recent.length === 0 ? <div className="empty-state"><div className="empty-icon">⌁</div><p>还没有连接</p><span>输入一个 DSH 地址，或复用 SSH 配置别名。</span></div> : (
             <div className="connection-list">
               {recent.map((record) => <article className="connection-row" key={record.id}>
                 <div className="connection-mark">{record.mode === 'direct' ? '↗' : '⌘'}</div>
                 <div className="connection-meta"><strong>{record.name}</strong><span>{displayConnection(record)}</span>
-                  <small>{statuses[record.id] ?? '未打开'}</small>
+                  <span className="entry-chain">{connectionEndpoints(record).map(entry => entry.label).join(" → ")}</span>
+                  {currentEntries[record.id] && <small>当前入口：{currentEntries[record.id]}</small>}
+                  <small role="status">{statuses[record.id] ?? '未打开'}</small>
                   <input aria-label={`${record.name} 一次性 token`} type="password" autoComplete="off" placeholder="首次登录 / 认证失效：粘贴 token（不保存）" value={tokens[record.id] ?? ''} onChange={event => { const value = event.currentTarget.value; setTokens(current => ({ ...current, [record.id]: value })) }} />
                 </div>
                 <div className="connection-actions"><button disabled={busy} className="primary-button compact" onClick={() => void openConnection(record)}>打开 / 重试</button><button disabled={busy} className="icon-button" title="编辑连接" onClick={() => editConnection(record)}>✎</button><button disabled={busy} className="icon-button" title="删除连接与浏览数据" onClick={() => void removeConnection(record)}>×</button></div>
@@ -150,22 +184,15 @@ function App() {
         </section>
 
         <section className="panel add-panel">
-          <div className="panel-heading"><div><p className="section-kicker">NEW CONNECTION</p><h2>{editing ? "编辑连接" : "新建连接"}</h2></div></div>
+          <div className="panel-heading"><div><p className="section-kicker">NEW CONNECTION</p><h2>{editing ? "编辑节点" : "新建节点"}</h2></div></div>
           <form className="connection-form" onSubmit={event => void addConnection(event)}>
             <label>显示名称<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })} placeholder="Mac mini · 本机" /></label>
-            <div className="segmented" role="group" aria-label="连接模式">
-              <button type="button" className={draft.mode === 'direct' ? 'selected' : ''} onClick={() => setDraft({ ...draft, mode: 'direct' })}>HTTPS / Web</button>
-              {capabilities.sshForward && <button type="button" className={draft.mode === 'ssh-forward' ? 'selected' : ''} onClick={() => setDraft({ ...draft, mode: 'ssh-forward' })}>SSH 转发</button>}
-            </div>
-            {draft.mode === 'direct' ? <label>DSH 地址<input value={draft.url} onChange={(event) => setDraft({ ...draft, url: event.currentTarget.value })} placeholder="https://dsh.example.test/" /></label> : <>
-              <label>SSH 配置<select value={draft.sshConfig ?? 'default'} onChange={event => setDraft({ ...draft, sshConfig: event.currentTarget.value as 'default' | 'fleet' | 'none' })}><option value="default">~/.ssh/config</option><option value="fleet">~/.ssh/dsh-fleet-config</option><option value="none">不读取配置（IP + 用户，系统默认密钥）</option></select></label>
-              <label>SSH Host 别名<input value={draft.sshProfile} onChange={(event) => setDraft({ ...draft, sshProfile: event.currentTarget.value })} placeholder="dsh-mac" /></label>
-              <div className="form-row"><label>远端用户（可选）<input value={draft.sshUser} onChange={(event) => setDraft({ ...draft, sshUser: event.currentTarget.value })} placeholder="沿用 SSH 配置" /></label><label>DSH 端口<input type="number" min="1" max="65535" value={draft.remotePort} onChange={(event) => setDraft({ ...draft, remotePort: Number(event.currentTarget.value) })} /></label></div>
-            </>}
+            <p className="form-hint">入口从上往下依次尝试，建议 LAN → WG。已打开窗口保持当前入口；关闭重开时重新按顺序选择。</p>
+            <EndpointEditor entries={entries} setEntries={setEntries} ssh={capabilities.sshForward} multiple={!capabilities.android} />
             <p className="form-hint">{capabilities.android && "Android 使用独立 WebView Profile，需要系统 WebView 支持；不支持时请更新系统 WebView。"}先保存不含 token 的地址，再在左侧连接的一次性输入框粘贴 token 并打开。SSH 使用已有密钥，首次使用前请在终端确认主机指纹。</p>
             {error && <p className="form-message error">{error}</p>}
             {notice && <p className="form-message notice">{notice}</p>}
-            <button disabled={busy} className="primary-button wide" type="submit">{editing ? "保存修改并关闭旧窗口" : "保存连接"}</button>{editing && <button type="button" onClick={() => { setEditing(null); setDraft(initialDraft) }}>取消编辑</button>}
+            <button disabled={busy} className="primary-button wide" type="submit">{editing ? "保存修改并关闭旧窗口" : "保存节点"}</button>{editing && <button type="button" onClick={() => { setEditing(null); setDraft(initialDraft); setEntries([blankEndpoint()]) }}>取消编辑</button>}
           </form>
         </section>
       </section>
