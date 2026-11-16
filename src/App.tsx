@@ -4,6 +4,7 @@ import { isTauri } from '@tauri-apps/api/core'
 import './App.css'
 import { createConnectionRecord, displayConnection, type ConnectionDraft, type ConnectionRecord } from './connection-model'
 import { ConnectionStore } from './connection-store'
+import { connectionCapabilities } from './platform-capabilities'
 
 const browserStorage = {
   getItem: (key: string) => window.localStorage.getItem(key),
@@ -15,6 +16,7 @@ const store = new ConnectionStore(browserStorage)
 const initialDraft: ConnectionDraft = { name: '', mode: 'direct', url: 'https://', sshProfile: '', sshUser: '', remotePort: 3080 }
 
 function App() {
+  const capabilities = connectionCapabilities(navigator.userAgent)
   const [connections, setConnections] = useState<ConnectionRecord[]>(store.list())
   const [draft, setDraft] = useState<ConnectionDraft>(initialDraft)
   const [error, setError] = useState('')
@@ -34,6 +36,7 @@ function App() {
     setNotice('')
     try {
       const record = createConnectionRecord(draft, editing ? () => editing.id : undefined)
+      if (capabilities.android && (record.mode !== 'direct' || !record.url?.startsWith('https://'))) throw new Error('Android 使用已有 HTTPS 入口，不支持 SSH 或本机 HTTP')
       if (editing) { record.createdAt = editing.createdAt; record.lastOpenedAt = editing.lastOpenedAt }
       if (editing && isTauri()) await invoke("close_connection", { id: editing.id })
       store.save(record)
@@ -75,7 +78,7 @@ function App() {
       store.remove(record.id)
       setTokens(current => { const next = { ...current }; delete next[record.id]; return next })
       refresh()
-      setNotice(`已删除 ${record.name}，并请求系统 WebView 清理该连接的浏览数据`)
+      setNotice(capabilities.android ? `已删除 ${record.name}；已加载的浏览分区将在下次启动后请求清理` : `已删除 ${record.name}，并请求系统 WebView 清理该连接的浏览数据`)
     } catch { setError('分区清理失败，连接记录已保留，请重试') }
     finally { setBusy(false) }
   }
@@ -122,14 +125,14 @@ function App() {
             <label>显示名称<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })} placeholder="Mac mini · 本机" /></label>
             <div className="segmented" role="group" aria-label="连接模式">
               <button type="button" className={draft.mode === 'direct' ? 'selected' : ''} onClick={() => setDraft({ ...draft, mode: 'direct' })}>HTTPS / Web</button>
-              <button type="button" className={draft.mode === 'ssh-forward' ? 'selected' : ''} onClick={() => setDraft({ ...draft, mode: 'ssh-forward' })}>SSH 转发</button>
+              {capabilities.sshForward && <button type="button" className={draft.mode === 'ssh-forward' ? 'selected' : ''} onClick={() => setDraft({ ...draft, mode: 'ssh-forward' })}>SSH 转发</button>}
             </div>
             {draft.mode === 'direct' ? <label>DSH 地址<input value={draft.url} onChange={(event) => setDraft({ ...draft, url: event.currentTarget.value })} placeholder="https://dsh.example.test/" /></label> : <>
               <label>SSH 配置<select value={draft.sshConfig ?? 'default'} onChange={event => setDraft({ ...draft, sshConfig: event.currentTarget.value as 'default' | 'fleet' | 'none' })}><option value="default">~/.ssh/config</option><option value="fleet">~/.ssh/dsh-fleet-config</option><option value="none">不读取配置（IP + 用户，系统默认密钥）</option></select></label>
               <label>SSH Host 别名<input value={draft.sshProfile} onChange={(event) => setDraft({ ...draft, sshProfile: event.currentTarget.value })} placeholder="dsh-mac" /></label>
               <div className="form-row"><label>远端用户（可选）<input value={draft.sshUser} onChange={(event) => setDraft({ ...draft, sshUser: event.currentTarget.value })} placeholder="沿用 SSH 配置" /></label><label>DSH 端口<input type="number" min="1" max="65535" value={draft.remotePort} onChange={(event) => setDraft({ ...draft, remotePort: Number(event.currentTarget.value) })} /></label></div>
             </>}
-            <p className="form-hint">先保存不含 token 的地址，再在左侧连接的一次性输入框粘贴 token 并打开。SSH 使用已有密钥，首次使用前请在终端确认主机指纹。</p>
+            <p className="form-hint">{capabilities.android && "Android 使用独立 WebView Profile，需要系统 WebView 支持；不支持时请更新系统 WebView。"}先保存不含 token 的地址，再在左侧连接的一次性输入框粘贴 token 并打开。SSH 使用已有密钥，首次使用前请在终端确认主机指纹。</p>
             {error && <p className="form-message error">{error}</p>}
             {notice && <p className="form-message notice">{notice}</p>}
             <button disabled={busy} className="primary-button wide" type="submit">{editing ? "保存修改并关闭旧窗口" : "保存连接"}</button>{editing && <button type="button" onClick={() => { setEditing(null); setDraft(initialDraft) }}>取消编辑</button>}

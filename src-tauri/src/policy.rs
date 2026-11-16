@@ -1,3 +1,4 @@
+#[cfg(any(not(target_os = "android"), test))]
 use sha2::{Digest, Sha256};
 use tauri::Url;
 
@@ -15,10 +16,12 @@ pub fn connection_id(id: &str) -> Result<(), String> {
     }
     Ok(())
 }
+#[cfg(any(not(target_os = "android"), test))]
 pub fn partition_id(id: &str) -> [u8; 16] {
     let digest = Sha256::digest(id.as_bytes());
     digest[..16].try_into().unwrap()
 }
+#[cfg(any(not(target_os = "android"), test))]
 pub fn local_port(id: &str) -> u16 {
     let bytes = partition_id(id);
     40000 + u16::from_be_bytes([bytes[0], bytes[1]]) % 20000
@@ -41,6 +44,7 @@ pub fn direct_url(raw: &str) -> Result<Url, String> {
     }
     Ok(url)
 }
+#[cfg(any(not(target_os = "android"), test))]
 pub fn same_origin(base: &Url, target: &Url) -> bool {
     base.origin() == target.origin()
 }
@@ -58,6 +62,7 @@ pub fn login_url(mut base: Url, token: Option<&str>) -> Result<Url, String> {
     }
     Ok(base)
 }
+#[cfg(any(not(target_os = "android"), test))]
 pub fn ssh_args(
     profile: &str,
     user: Option<&str>,
@@ -110,6 +115,7 @@ pub fn ssh_args(
     Ok(args)
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 pub fn transport_response(response: &[u8]) -> bool {
     response.starts_with(b"HTTP/")
         && matches!(
@@ -118,9 +124,29 @@ pub fn transport_response(response: &[u8]) -> bool {
         )
 }
 
+#[cfg(any(target_os = "android", test))]
+pub fn android_url(raw: &str, token: Option<&str>) -> Result<Url, String> {
+    let base = direct_url(raw)?;
+    if base.scheme() != "https" {
+        return Err("Android 只支持已有 HTTPS 入口".into());
+    }
+    login_url(base, token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn android_rejects_local_http_even_when_desktop_allows_it() {
+        assert!(android_url("http://127.0.0.1:3080/", None).is_err());
+        assert!(android_url("https://dsh.test/?token=secret", None).is_err());
+        assert_eq!(
+            android_url("https://dsh.test/", Some("fake-token"))
+                .unwrap()
+                .query(),
+            Some("token=fake-token")
+        );
+    }
     #[test]
     fn rejects_gateway_errors_without_mistaking_login_gate_for_health() {
         assert!(transport_response(b"HTTP/1.1 401"));

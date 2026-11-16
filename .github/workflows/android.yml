@@ -1,0 +1,65 @@
+name: Build Android client
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 'feat/**']
+    paths-ignore: ['docs/**', '*.md']
+  pull_request:
+    paths-ignore: ['docs/**', '*.md']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '12.4.2'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: android-aarch64
+      - name: Install SDK and NDK
+        run: |
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;29.0.14206865'
+          echo "NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm typecheck
+      - name: Test native Android URL policy
+        run: |
+          javac -d "$RUNNER_TEMP/android-policy" tests/AndroidPolicyTest.java src-tauri/gen/android/app/src/main/java/com/zcj/dshclient/ContentPolicy.java
+          java -cp "$RUNNER_TEMP/android-policy" AndroidPolicyTest
+      - name: Build debug APK
+        run: pnpm tauri android build --debug --target aarch64 --apk
+      - name: Compile native device tests
+        working-directory: src-tauri/gen/android
+        run: ./gradlew :app:assembleUniversalDebugAndroidTest -x rustBuildUniversalDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-client-android-arm64-debug
+          path: |
+            src-tauri/gen/android/app/build/outputs/apk/universal/debug/*.apk
+            src-tauri/gen/android/app/build/outputs/apk/androidTest/universal/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14

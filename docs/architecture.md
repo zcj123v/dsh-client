@@ -12,7 +12,7 @@
 
 macOS 14+ 使用连接 ID SHA-256 的前 16 字节作为 WKWebView data store 标识；Windows/Linux 使用独立 data directory。不同连接拥有不同 Cookie/LocalStorage 容器。退出保留数据；删除连接请求系统异步清理，随后废弃 ID。系统清理 API 无同步完成保证。
 
-Android 当前尚无原生工程和 per-connection 容器；Tauri Android 不支持 data_directory/data_store_identifier，不能直接复用桌面隔离方案。需要独立 Activity/进程或原生 WebView profile 方案后才能发布。
+Android 使用原生普通 Activity + WebViewCompat.setProfile，在任何设置/导航前选定连接 Profile；不使用 Tauri 的桌面分区选项，也不向远端注入 IPC。系统 WebView 不支持 MULTI_PROFILE 时拒绝打开。删除已加载 Profile 用持久墓碑，下次进程启动、尚未加载时清理；详见 Android 操作文档。arm64 APK 已编译，设备隔离和真实 DSH 业务仍需验收。
 
 ## SSH 转发
 

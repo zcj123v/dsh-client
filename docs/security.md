@@ -9,6 +9,8 @@
 - token 加载完即从当前导航历史项移除。WebView 内部瞬态网络请求/缓存由平台处理；不承诺可证明的内存擦除或对系统诊断隐藏。
 - 删除连接请求异步浏览数据清理，系统 API 不提供完成回调；UI 明确为“请求清理”，旧分区 ID 不复用。严格同步擦除仍需平台实现与独立验收。
 - 外链过滤不是远端页面的完整数据防泄露沙箱；只有受信任的个人 DSH 入口应加入连接列表。
-- macOS 分区最低要求系统 14；Android 分区未实现；Windows/Linux 尚未实机验证。
+- macOS 分区最低要求系统 14；Android 以独立命名 Profile 隔离，不支持特性时拒绝打开；Windows/Linux 已原生 CI 构建，用户桌面仍待验证。
 - TLS 仅使用系统信任链，不静默忽略证书错误；证书指纹 pinning、自签名例外、Android SSH 都尚未实现。
 - 运行态不得打印 token、Cookie、Authorization、Basic Auth 或私钥。单元测试只使用假值。
+
+- Android 远端容器不是 TauriActivity，无 JavaScript interface。Activity 不导出、备份关闭、token 不进入 Intent/恢复 Bundle；HTTPS-only、混合内容拒绝，内容页截屏受 FLAG_SECURE 保护。已加载的 Profile 删除使用持久墓碑，下次进程启动时处理，不能承诺本次调用已完成磁盘擦除。
