@@ -60,3 +60,6 @@ shasum -a 256 DSH-Client-arm64.zip
 
 
 当前0.2.0源码已合入main（`ec91d3c`），最终 [Android构建](https://github.com/zcj123v/dsh-client/actions/runs/43815786483) 和 [三桌面构建](https://github.com/zcj123v/dsh-client/actions/runs/43815786494) 全成功。Android API36模拟器3项仪器测试、真实本地壳→原生内容调用/无IPC、删除标记重启清理均已验证。`.13`暂保留已安装0.1.1供现场测试，构建新版本不代表已更新该机器。
+
+
+0.2.1（`a2c5601`）补齐桌面SSH有限退避重连、原窗口手动重试和代际状态过滤，修复旧窗口回调误清新任务的竞争。本机12项Rust生命周期/安全测试、14项前端测试与真实`.13`转发丢失/恢复/回收通过；[三桌面CI43829650070](https://github.com/zcj123v/dsh-client/actions/runs/43829650070) 和 [AndroidCI43829655132](https://github.com/zcj123v/dsh-client/actions/runs/43829655132) 全绿。macOS同origin两连接Cookie/LocalStorage隔离、同连接重开恢复、远端命令拒绝已实测。`.13`仍保留0.1.1现场版本。

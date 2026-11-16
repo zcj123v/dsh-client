@@ -27,3 +27,6 @@ macOS DMG 打包器曾因 Finder AppleEvent 超时失败；本轮使用 --bundle
 SSH 回归使用真正HTTP子进程测试首次ready后kill→同port恢复、三次预算、退避取消、端口抢占拒绝，以及旧窗口teardown不杀替换task；并以获授权普通用户`.13` SSH路径实测kill转发→重建→kill/wait和端口重绑。该测试只核实传输，不把预登录401当业务成功。
 
 恢复会重新导航到根页，未发送的页面编辑内容可能丢失；只恢复系统Cookie，不保留/重放一次性token。三次失败后用户可手动再试。系统OpenSSH的保活最长检测延迟由15秒×3控制；不是连接断开立即报告。
+
+
+0.2.1本机未签名arm64 APP/ZIP构建成功并实际启动显示tauri://localhost连接列表；ZIP SHA256 `b90ccce0eb5fa922c955696e1bce6bcb232f8105c24a1726e698642b91f25436`。初轮macOSCI两个Python HTTP fixture等待超时，替换为Rust测试程序自身的独立HTTP子进程后最终四端CI全部通过（桌面43829650070、Android43829655132）；未屏蔽测试。生产实现自784e29a至a2c5601未变，仅测试fixture变更。审查者复核任务实例、窗口weak-slot、exactview与UIgeneration后无阻断项。
