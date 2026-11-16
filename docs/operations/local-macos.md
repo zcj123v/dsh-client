@@ -30,3 +30,16 @@ SSH 回归使用真正HTTP子进程测试首次ready后kill→同port恢复、�
 
 
 0.2.1本机未签名arm64 APP/ZIP构建成功并实际启动显示tauri://localhost连接列表；ZIP SHA256 `b90ccce0eb5fa922c955696e1bce6bcb232f8105c24a1726e698642b91f25436`。初轮macOSCI两个Python HTTP fixture等待超时，替换为Rust测试程序自身的独立HTTP子进程后最终四端CI全部通过（桌面43829650070、Android43829655132）；未屏蔽测试。生产实现自784e29a至a2c5601未变，仅测试fixture变更。审查者复核任务实例、窗口weak-slot、exactview与UIgeneration后无阻断项。
+
+
+## 0.2.1 发布应用真实附件验收（2026-11-16 18:0x）
+
+本轮使用已经构建的macOS arm64 0.2.1发布APP（PID8341，非浏览器替身），连接本机127.0.0.1:3080。实际完成本地一次性密码框→token/Cookie→完整DSH工作区、会话和原生文件选择对话框→选择仅含假数据的111B文本→网页待发送附件→发送测试消息。会话“DSH Client 附件链路验收”显示附件111B、已完成和 `DSH_CLIENT_ATTACHMENT_OK`。
+
+不能仅凭模型回复认定文件到达：本机DSH的 `attachments/v1/file-objects/e7/e7c0898b89eefcc21c81a4c7ec640fc1a953561a873a1ebe7b70ae53855bf48c` 与 `attachments/v1/files/e7/<同SHA>/DSH-Client-Attachment-Smoke-20261116.txt` 都逐字节等于原始111B文件，SHA256 `e7c0898b89eefcc21c81a4c7ec640fc1a953561a873a1ebe7b70ae53855bf48c`。最初误查图片objects路径未找到，改查普通file-objects后实际核对通过；无伪造上传HTTP请求或替换文件选择回调。
+
+随后关闭连接窗口6074，从主列表空token重开6186，完整认证页面和刚才附件会话直接恢复，根URL不带query。主列表有“窗口已关闭”状态，重开后正常。此次只做关闭/重开，不能扩大为系统重启持久化或网络物理断开；前轮已有0.1.1进程重启Cookie与0.2.1SSH恢复证据。
+
+GUI自动化遇到坐标/索引混用、密码框焦点与原生对话框快捷键不生效，改为新截图坐标和原生picker当前Documents目录中唯一合成测试文件；确认选定文件名与111B后才发送。SystemEvents脚本未返回，已停止；Documents合成副本已核路径/字节后删除，服务端假附件和测试会话保留作证据。token只经本机脚本直接pbcopy到密码框，未打印或入仓，提交后剪贴板清空。命令行token探针必须保留303重定向的Cookie，普通urlopen无CookieJar会错误地落到401。
+
+`.13`再次只读核对为zcj123vdeMacBook-Air.local/arm64，安装仍0.1.1，二进制SHA256 `b08209ed82a499de332e849d20ade9c87450412cff50ae88cca975991af5fa69`，worker仍10813。未更新用户现场测试版本、未重启Host。macOS本轮只验证普通文本附件上传和返回，不宣称Android/WinLinux真实DSH上传或通用下载通过。
