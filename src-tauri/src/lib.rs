@@ -63,7 +63,50 @@ impl Drop for Tunnel {
     }
 }
 #[cfg(not(target_os = "android"))]
-type WindowTunnel = Arc<Mutex<Option<Weak<Mutex<Tunnel>>>>>;
+type WindowTunnel = Arc<Mutex<WindowBinding>>;
+#[cfg(not(target_os = "android"))]
+#[derive(Default)]
+struct WindowBinding {
+    child: Option<Weak<Mutex<Tunnel>>>,
+    generation: u64,
+}
+#[cfg(not(target_os = "android"))]
+fn bind_pending_slot(
+    state: &Connections,
+    id: &str,
+    child: &Arc<Mutex<Tunnel>>,
+) -> Result<(), String> {
+    let generation = child.lock().map_err(|_| "SSH 状态不可用")?.generation;
+    if let Some(slot) = state
+        .window_tunnels
+        .lock()
+        .map_err(|_| "窗口状态不可用")?
+        .get(id)
+    {
+        let mut binding = slot.lock().map_err(|_| "窗口状态不可用")?;
+        binding.child = Some(Arc::downgrade(child));
+        binding.generation = generation;
+    }
+    Ok(())
+}
+#[cfg(not(target_os = "android"))]
+struct TunnelAttempt {
+    rollback: Option<Box<dyn FnOnce() + Send>>,
+}
+#[cfg(not(target_os = "android"))]
+impl Drop for TunnelAttempt {
+    fn drop(&mut self) {
+        if let Some(rollback) = self.rollback.take() {
+            rollback()
+        }
+    }
+}
+#[cfg(not(target_os = "android"))]
+impl TunnelAttempt {
+    fn commit(&mut self) {
+        self.rollback = None;
+    }
+}
 #[cfg(not(target_os = "android"))]
 #[derive(Default)]
 struct Connections {
@@ -158,8 +201,16 @@ fn register_tunnel(
 }
 #[cfg(not(target_os = "android"))]
 fn ssh_ready(child: Arc<Mutex<Tunnel>>, port: u16) -> Result<(), String> {
+    ssh_ready_with_timeout(child, port, Duration::from_secs(12))
+}
+#[cfg(not(target_os = "android"))]
+fn ssh_ready_with_timeout(
+    child: Arc<Mutex<Tunnel>>,
+    port: u16,
+    timeout: Duration,
+) -> Result<(), String> {
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < timeout {
         if child.lock().map(|t| t.stopped).unwrap_or(true) {
             return Err("连接已关闭".into());
         }
@@ -370,6 +421,7 @@ async fn open_connection(
             existing.set_focus().map_err(|_| "无法聚焦连接窗口")?;
             return Ok(tunnel_generation(&app, &record.id));
         }
+        let mut pending: Option<TunnelAttempt> = None;
         let base = match record.mode.as_str() {
             "direct" => direct_url(record.url.as_deref().ok_or("缺少 DSH 地址")?)?,
             "ssh-forward" => {
@@ -416,8 +468,23 @@ async fn open_connection(
                         .stderr(Stdio::null());
                     let child =
                         register_tunnel(&app.state::<Connections>(), &record.id, command, port)?;
-                    let result =
-                        tauri::async_runtime::spawn_blocking(move || ssh_ready(child, port)).await;
+                    let rollback_app = app.clone();
+                    let rollback_id = record.id.clone();
+                    let rollback_child = child.clone();
+                    pending = Some(TunnelAttempt {
+                        rollback: Some(Box::new(move || {
+                            stop_tunnel_state(
+                                &rollback_app.state::<Connections>(),
+                                &rollback_id,
+                                Some(&rollback_child),
+                            )
+                        })),
+                    });
+                    bind_pending_slot(&app.state::<Connections>(), &record.id, &child)?;
+                    let result = tauri::async_runtime::spawn_blocking(move || {
+                        ssh_ready_with_timeout(child, port, Duration::from_secs(5))
+                    })
+                    .await;
                     match result {
                         Ok(Ok(())) => (),
                         _ => {
@@ -439,6 +506,9 @@ async fn open_connection(
                 .navigate(target)
                 .map_err(|_| "无法重新加载连接窗口")?;
             existing.set_focus().map_err(|_| "无法聚焦连接窗口")?;
+            if let Some(guard) = pending.as_mut() {
+                guard.commit();
+            }
             return Ok(tunnel_generation(&app, &record.id));
         }
         let nav_base = base.clone();
@@ -502,7 +572,19 @@ async fn open_connection(
             .lock()
             .map_err(|_| "连接状态不可用")?
             .insert(record.id.clone(), base.clone());
-        let slot = Arc::new(Mutex::new(None));
+        let initial_generation = if record.mode == "direct" {
+            NEXT_GENERATION.fetch_add(1, Ordering::SeqCst)
+        } else {
+            tunnel_generation(&app, &record.id)
+        };
+        let slot = Arc::new(Mutex::new(WindowBinding {
+            child: None,
+            generation: if initial_generation == 0 {
+                NEXT_GENERATION.fetch_add(1, Ordering::SeqCst)
+            } else {
+                initial_generation
+            },
+        }));
         app.state::<Connections>()
             .window_tunnels
             .lock()
@@ -514,7 +596,7 @@ async fn open_connection(
         let close_id = record.id;
         view.on_window_event(move |event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
-                let expected = slot.lock().ok().and_then(|slot| slot.as_ref().and_then(Weak::upgrade));
+                let (expected,generation) = slot.lock().map(|slot|(slot.child.as_ref().and_then(Weak::upgrade),slot.generation)).unwrap_or((None,generation));
                 if let Some(expected) = expected {
                     stop_tunnel_state(&close_app.state::<Connections>(), &close_id, Some(&expected));
                 }
@@ -523,6 +605,9 @@ async fn open_connection(
                 }
             }
         });
+        if let Some(guard) = pending.as_mut() {
+            guard.commit();
+        }
         Ok(generation)
     }
 }
@@ -537,7 +622,11 @@ fn install_recovery_events(app: &tauri::AppHandle, id: &str, base: &tauri::Url) 
     if let Ok(slots) = state.window_tunnels.lock() {
         if let Some(slot) = slots.get(id) {
             if let Ok(mut bound) = slot.lock() {
-                *bound = Some(expected.clone());
+                bound.child = Some(expected.clone());
+                bound.generation = child
+                    .lock()
+                    .map(|t| t.generation)
+                    .unwrap_or(bound.generation);
             }
         }
     }
@@ -587,7 +676,18 @@ fn tunnel_generation(app: &tauri::AppHandle, id: &str) -> u64 {
                 .get(id)
                 .and_then(|t| t.lock().ok().map(|t| t.generation))
         })
-        .unwrap_or(0)
+        .unwrap_or_else(|| {
+            app.state::<Connections>()
+                .window_tunnels
+                .lock()
+                .ok()
+                .and_then(|slots| {
+                    slots
+                        .get(id)
+                        .and_then(|slot| slot.lock().ok().map(|slot| slot.generation))
+                })
+                .unwrap_or(0)
+        })
 }
 #[cfg(not(target_os = "android"))]
 fn open_external(app: &tauri::AppHandle, url: &tauri::Url) {
@@ -825,6 +925,83 @@ mod lifecycle_tests {
             let _ = send.send((status.to_owned(), attempt));
         }));
         receive
+    }
+    #[test]
+    fn closing_manual_retry_window_cancels_new_pending_before_readiness() {
+        let fixture = Fixture(Connections::default());
+        let slot: WindowTunnel = Arc::new(Mutex::new(WindowBinding::default()));
+        fixture
+            .0
+            .window_tunnels
+            .lock()
+            .unwrap()
+            .insert("retry".into(), slot.clone());
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let pending = register_tunnel(&fixture.0, "retry", command, 45999).unwrap();
+        bind_pending_slot(&fixture.0, "retry", &pending).unwrap();
+        assert_eq!(
+            slot.lock().unwrap().generation,
+            pending.lock().unwrap().generation
+        );
+        // This is the exact per-window Destroyed callback's lookup/cleanup path.
+        let bound = slot
+            .lock()
+            .unwrap()
+            .child
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .unwrap();
+        stop_tunnel_state(&fixture.0, "retry", Some(&bound));
+        assert!(
+            pending
+                .lock()
+                .unwrap()
+                .process
+                .try_wait()
+                .unwrap()
+                .is_some()
+        );
+        assert!(!fixture.0.tunnels.lock().unwrap().contains_key("retry"));
+    }
+    #[test]
+    fn failed_open_attempt_rolls_back_pending_and_success_disarms_cleanup() {
+        let fixture = Arc::new(Fixture(Connections::default()));
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let pending = register_tunnel(&fixture.0, "attempt", command, 45998).unwrap();
+        let state = fixture.clone();
+        let child = pending.clone();
+        let guard = TunnelAttempt {
+            rollback: Some(Box::new(move || {
+                stop_tunnel_state(&state.0, "attempt", Some(&child))
+            })),
+        };
+        drop(guard);
+        assert!(
+            pending
+                .lock()
+                .unwrap()
+                .process
+                .try_wait()
+                .unwrap()
+                .is_some()
+        );
+        assert!(!fixture.0.tunnels.lock().unwrap().contains_key("attempt"));
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let alive = register_tunnel(&fixture.0, "success", command, 45997).unwrap();
+        let state = fixture.clone();
+        let child = alive.clone();
+        let mut guard = TunnelAttempt {
+            rollback: Some(Box::new(move || {
+                stop_tunnel_state(&state.0, "success", Some(&child))
+            })),
+        };
+        guard.commit();
+        drop(guard);
+        assert!(alive.lock().unwrap().process.try_wait().unwrap().is_none());
+        stop_tunnel_state(&fixture.0, "success", Some(&alive));
     }
     #[test]
     fn failed_recovery_has_a_finite_budget_and_leaves_no_child() {

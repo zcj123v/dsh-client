@@ -144,11 +144,11 @@ mod tests {
                 .unwrap();
             let mut buf = [0; 2048];
             let len = stream.read(&mut buf).unwrap();
-            let request = String::from_utf8_lossy(&buf[..len]);
+            let request = String::from_utf8_lossy(&buf[..len]).to_ascii_lowercase();
             assert!(
                 !request.contains("token=")
-                    && !request.contains("Authorization:")
-                    && !request.contains("Cookie:")
+                    && !request.contains("authorization:")
+                    && !request.contains("cookie:")
             );
             write!(stream,"HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nLocation: http://127.0.0.1:1/\r\nConnection: close\r\n\r\n").unwrap();
         });

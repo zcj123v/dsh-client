@@ -50,6 +50,7 @@ function App() {
       }
       if (typeof status.state === 'string' && Object.prototype.hasOwnProperty.call(messages, status.state)) {
         setStatuses(current => ({ ...current, [status.id as string]: messages[status.state as string]! }))
+        if (status.state === 'disconnected') setCurrentEntries(current => { const next = { ...current }; delete next[status.id as string]; return next })
       }
     }).then(stop => { if (disposed) stop(); else unlisten = stop }).catch(() => {
       if (!disposed) setNotice('无法接收连接状态；可关闭连接窗口后手动重试')
@@ -81,6 +82,7 @@ function App() {
     try {
       const record = createConnectionRecord({ ...draft, endpoints: entries }, editing ? () => editing.id : undefined)
       if (capabilities.android && (connectionEndpoints(record).some(entry => entry.mode !== 'direct' || !entry.url?.startsWith('https://')))) throw new Error('Android 使用已有 HTTPS 入口，不支持 SSH 或本机 HTTP')
+      if (editing) setCurrentEntries(current => { const next = { ...current }; delete next[editing.id]; return next })
       if (editing) { record.createdAt = editing.createdAt; record.lastOpenedAt = editing.lastOpenedAt }
       if (editing && isTauri()) await invoke("close_connection", { id: editing.id })
       store.save(record)
@@ -102,6 +104,7 @@ function App() {
     setNotice('')
     const token = tokens[record.id]?.trim() || null
     setTokens(current => ({ ...current, [record.id]: '' }))
+    setCurrentEntries(current => { const next = { ...current }; delete next[record.id]; return next })
     generations.current[record.id] = null
     setStatuses(current => ({ ...current, [record.id]: '正在连接…' }))
     try {
