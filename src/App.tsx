@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
-import { useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { isTauri } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import './App.css'
 import { createConnectionRecord, displayConnection, type ConnectionDraft, type ConnectionRecord } from './connection-model'
 import { ConnectionStore } from './connection-store'
@@ -24,7 +25,33 @@ function App() {
   const [tokens, setTokens] = useState<Record<string, string>>({})
   const [statuses, setStatuses] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
+  const generations = useRef<Record<string, number | null>>({})
   const [editing, setEditing] = useState<ConnectionRecord | null>(null)
+
+  useEffect(() => {
+    if (!isTauri()) return
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void listen<unknown>('connection-status', event => {
+      if (disposed || !event.payload || typeof event.payload !== 'object') return
+      const status = event.payload as Record<string, unknown>
+      if (typeof status.id !== 'string' || !store.list().some(record => record.id === status.id)) return
+      if (typeof status.generation !== 'number' || generations.current[status.id] !== status.generation) return
+      if (typeof status.attempt !== 'number' || !Number.isInteger(status.attempt) || status.attempt < 0 || status.attempt > 3) return
+      const messages: Record<string, string> = {
+        reconnecting: `SSH 已断开 · 正在重连（${status.attempt}/3）`,
+        ready: 'SSH 转发已恢复 · 登录状态见 DSH 页面',
+        failed: 'SSH 自动重连已停止 · 点击打开 / 重试',
+        disconnected: '窗口已关闭',
+      }
+      if (typeof status.state === 'string' && Object.prototype.hasOwnProperty.call(messages, status.state)) {
+        setStatuses(current => ({ ...current, [status.id as string]: messages[status.state as string]! }))
+      }
+    }).then(stop => { if (disposed) stop(); else unlisten = stop }).catch(() => {
+      if (!disposed) setNotice('无法接收连接状态；可关闭连接窗口后手动重试')
+    })
+    return () => { disposed = true; unlisten?.() }
+  }, [])
 
   const recent = useMemo(() => [...connections].sort((a, b) => (b.lastOpenedAt ?? '').localeCompare(a.lastOpenedAt ?? '')), [connections])
 
@@ -56,10 +83,12 @@ function App() {
     setNotice('')
     const token = tokens[record.id]?.trim() || null
     setTokens(current => ({ ...current, [record.id]: '' }))
+    generations.current[record.id] = null
     setStatuses(current => ({ ...current, [record.id]: '正在连接…' }))
     try {
       if (!isTauri()) throw new Error('请在 DSH Client 应用中打开连接；浏览器页面仅用于预览')
-      await invoke('open_connection', { record, token })
+      const generation = await invoke<number>('open_connection', { record, token })
+      generations.current[record.id] = generation
       store.markOpened(record.id)
       refresh()
       setStatuses(current => ({ ...current, [record.id]: '窗口已打开 · 登录状态见 DSH 页面' }))
@@ -75,6 +104,7 @@ function App() {
     setError('')
     try {
       if (isTauri()) await invoke('delete_connection', { id: record.id })
+      delete generations.current[record.id]
       store.remove(record.id)
       setTokens(current => { const next = { ...current }; delete next[record.id]; return next })
       refresh()
