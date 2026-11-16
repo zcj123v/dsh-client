@@ -67,27 +67,32 @@ type WindowTunnel = Arc<Mutex<WindowBinding>>;
 #[cfg(not(target_os = "android"))]
 #[derive(Default)]
 struct WindowBinding {
+    closed: bool,
     child: Option<Weak<Mutex<Tunnel>>>,
     generation: u64,
 }
 #[cfg(not(target_os = "android"))]
-fn bind_pending_slot(
-    state: &Connections,
-    id: &str,
-    child: &Arc<Mutex<Tunnel>>,
-) -> Result<(), String> {
+fn bind_pending_slot(slot: &WindowTunnel, child: &Arc<Mutex<Tunnel>>) -> Result<(), String> {
     let generation = child.lock().map_err(|_| "SSH 状态不可用")?.generation;
-    if let Some(slot) = state
-        .window_tunnels
-        .lock()
-        .map_err(|_| "窗口状态不可用")?
-        .get(id)
-    {
-        let mut binding = slot.lock().map_err(|_| "窗口状态不可用")?;
-        binding.child = Some(Arc::downgrade(child));
-        binding.generation = generation;
+    let mut binding = slot.lock().map_err(|_| "窗口状态不可用")?;
+    if binding.closed {
+        return Err("连接窗口已关闭".into());
     }
+    binding.child = Some(Arc::downgrade(child));
+    binding.generation = generation;
     Ok(())
+}
+#[cfg(not(target_os = "android"))]
+fn close_binding(slot: &WindowTunnel) -> (Option<Arc<Mutex<Tunnel>>>, u64) {
+    slot.lock()
+        .map(|mut binding| {
+            binding.closed = true;
+            (
+                binding.child.as_ref().and_then(Weak::upgrade),
+                binding.generation,
+            )
+        })
+        .unwrap_or((None, 0))
 }
 #[cfg(not(target_os = "android"))]
 struct TunnelAttempt {
@@ -393,6 +398,19 @@ async fn open_connection(
     {
         let label = format!("dsh-{}", record.id);
         let existing = app.get_webview_window(&label);
+        let existing_slot = if existing.is_some() {
+            Some(
+                app.state::<Connections>()
+                    .window_tunnels
+                    .lock()
+                    .map_err(|_| "窗口状态不可用")?
+                    .get(&record.id)
+                    .cloned()
+                    .ok_or("请关闭旧窗口后重试")?,
+            )
+        } else {
+            None
+        };
         let needs_retry = record.mode == "ssh-forward" && {
             let state = app.state::<Connections>();
             let tunnels = state.tunnels.lock().map_err(|_| "SSH 状态不可用")?;
@@ -480,7 +498,9 @@ async fn open_connection(
                             )
                         })),
                     });
-                    bind_pending_slot(&app.state::<Connections>(), &record.id, &child)?;
+                    if let Some(slot) = existing_slot.as_ref() {
+                        bind_pending_slot(slot, &child)?;
+                    }
                     let result = tauri::async_runtime::spawn_blocking(move || {
                         ssh_ready_with_timeout(child, port, Duration::from_secs(5))
                     })
@@ -502,6 +522,14 @@ async fn open_connection(
         let target = login_url(base.clone(), token.as_deref())?;
         if let Some(existing) = existing {
             install_recovery_events(&app, &record.id, &base);
+            let binding = existing_slot
+                .as_ref()
+                .ok_or("窗口状态不可用")?
+                .lock()
+                .map_err(|_| "窗口状态不可用")?;
+            if binding.closed {
+                return Err("连接窗口已关闭".into());
+            }
             existing
                 .navigate(target)
                 .map_err(|_| "无法重新加载连接窗口")?;
@@ -578,6 +606,7 @@ async fn open_connection(
             tunnel_generation(&app, &record.id)
         };
         let slot = Arc::new(Mutex::new(WindowBinding {
+            closed: false,
             child: None,
             generation: if initial_generation == 0 {
                 NEXT_GENERATION.fetch_add(1, Ordering::SeqCst)
@@ -596,7 +625,7 @@ async fn open_connection(
         let close_id = record.id;
         view.on_window_event(move |event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
-                let (expected,generation) = slot.lock().map(|slot|(slot.child.as_ref().and_then(Weak::upgrade),slot.generation)).unwrap_or((None,generation));
+                let (expected, generation) = close_binding(&slot);
                 if let Some(expected) = expected {
                     stop_tunnel_state(&close_app.state::<Connections>(), &close_id, Some(&expected));
                 }
@@ -879,6 +908,9 @@ mod lifecycle_tests {
             .expect("fixture port required")
             .parse()
             .unwrap();
+        if let Ok(delay) = std::env::var("DSH_CLIENT_HTTP_FIXTURE_DELAY_MS") {
+            std::thread::sleep(Duration::from_millis(delay.parse().unwrap()));
+        }
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         for incoming in listener.incoming() {
             let mut stream = incoming.unwrap();
@@ -939,19 +971,13 @@ mod lifecycle_tests {
         let mut command = Command::new("sleep");
         command.arg("30");
         let pending = register_tunnel(&fixture.0, "retry", command, 45999).unwrap();
-        bind_pending_slot(&fixture.0, "retry", &pending).unwrap();
+        bind_pending_slot(&slot, &pending).unwrap();
         assert_eq!(
             slot.lock().unwrap().generation,
             pending.lock().unwrap().generation
         );
         // This is the exact per-window Destroyed callback's lookup/cleanup path.
-        let bound = slot
-            .lock()
-            .unwrap()
-            .child
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .unwrap();
+        let bound = close_binding(&slot).0.unwrap();
         stop_tunnel_state(&fixture.0, "retry", Some(&bound));
         assert!(
             pending
@@ -963,6 +989,34 @@ mod lifecycle_tests {
                 .is_some()
         );
         assert!(!fixture.0.tunnels.lock().unwrap().contains_key("retry"));
+    }
+    #[test]
+    fn window_closed_before_pending_bind_cancels_the_exact_new_child() {
+        let fixture = Arc::new(Fixture(Connections::default()));
+        let slot = Arc::new(Mutex::new(WindowBinding::default()));
+        assert!(close_binding(&slot).0.is_none());
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let pending = register_tunnel(&fixture.0, "race", command, 45996).unwrap();
+        let state = fixture.clone();
+        let child = pending.clone();
+        let guard = TunnelAttempt {
+            rollback: Some(Box::new(move || {
+                stop_tunnel_state(&state.0, "race", Some(&child))
+            })),
+        };
+        assert!(bind_pending_slot(&slot, &pending).is_err());
+        drop(guard);
+        assert!(
+            pending
+                .lock()
+                .unwrap()
+                .process
+                .try_wait()
+                .unwrap()
+                .is_some()
+        );
+        assert!(!fixture.0.tunnels.lock().unwrap().contains_key("race"));
     }
     #[test]
     fn failed_open_attempt_rolls_back_pending_and_success_disarms_cleanup() {
@@ -1002,6 +1056,25 @@ mod lifecycle_tests {
         drop(guard);
         assert!(alive.lock().unwrap().process.try_wait().unwrap().is_none());
         stop_tunnel_state(&fixture.0, "success", Some(&alive));
+    }
+    #[test]
+    fn initial_five_second_budget_does_not_shorten_running_recovery_budget() {
+        let fixture = Fixture(Connections::default());
+        let reserved = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let mut command = fixture_command(port);
+        command.env("DSH_CLIENT_HTTP_FIXTURE_DELAY_MS", "6000");
+        let child = register_tunnel(&fixture.0, "slow", command, port).unwrap();
+        assert!(ssh_ready_with_timeout(child.clone(), port, Duration::from_secs(5)).is_err());
+        stop_tunnel_state(&fixture.0, "slow", Some(&child));
+        let mut command = fixture_command(port);
+        command.env("DSH_CLIENT_HTTP_FIXTURE_DELAY_MS", "6000");
+        let child = register_tunnel(&fixture.0, "slow", command, port).unwrap();
+        // Independent delayed child needs over five seconds from this recovery call.
+        assert!(ssh_ready(child.clone(), port).is_ok());
+        stop_tunnel_state(&fixture.0, "slow", Some(&child));
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
     }
     #[test]
     fn failed_recovery_has_a_finite_budget_and_leaves_no_child() {
