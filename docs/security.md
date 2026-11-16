@@ -14,3 +14,5 @@
 - 运行态不得打印 token、Cookie、Authorization、Basic Auth 或私钥。单元测试只使用假值。
 
 - Android 远端容器不是 TauriActivity，无 JavaScript interface。Activity 不导出、备份关闭、token 不进入 Intent/恢复 Bundle；HTTPS-only、混合内容拒绝，内容页截屏受 FLAG_SECURE 保护。已加载的 Profile 删除使用持久墓碑，下次进程启动时处理，不能承诺本次调用已完成磁盘擦除。
+
+- Android0.2.2保持主导航认证/网络/TLS错误直到下一次导航，不由onPageFinished覆盖。真实自签名loopbackTLS探针已验证系统证书拒绝、失败提示保留且页面不执行；未导入测试证书，不放宽信任链。系统可信证书/SAN路径属于当前支持范围，可选pinning及自签名例外仍不支持。

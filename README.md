@@ -63,3 +63,6 @@ shasum -a 256 DSH-Client-arm64.zip
 
 
 0.2.1（`a2c5601`）补齐桌面SSH有限退避重连、原窗口手动重试和代际状态过滤，修复旧窗口回调误清新任务的竞争。本机12项Rust生命周期/安全测试、14项前端测试与真实`.13`转发丢失/恢复/回收通过；[三桌面CI43829650070](https://github.com/zcj123v/dsh-client/actions/runs/43829650070) 和 [AndroidCI43829655132](https://github.com/zcj123v/dsh-client/actions/runs/43829655132) 全绿。macOS同origin两连接Cookie/LocalStorage隔离、同连接重开恢复、远端命令拒绝已实测。`.13`仍保留0.1.1现场版本。
+
+
+0.2.2修复Android认证/网络/TLS失败提示被页面加载完成事件覆盖的问题，并为状态变化加入读屏live region。API36模拟器最终6项仪器测试通过，含真实DNS失败、自签名证书拒绝与内容未执行；证书只用于临时探针。Android真机DSH业务仍待验，桌面运行验证沿用0.2.1。
