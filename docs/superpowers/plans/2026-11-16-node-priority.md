@@ -22,19 +22,19 @@
 ### Task 1: 节点数据与管理UI
 **Files:** src/connection-model.ts,src/connection-store.ts,src/App.tsx,src/App.css,tests/connection-model.test.ts,tests/connection-store.test.ts,tests/App.test.tsx
 **Interfaces:** Endpoint包含label/mode/url/sshConfig/sshProfile/sshUser/remotePort；ConnectionDraft/Record可含endpoints。旧top-level字段表示第一入口以兼容旧端。
-- [ ] 先写多入口保存重载顺序/拒非法URL/secret白名单、本机按钮去重和入口移动测试，pnpm test验证红。
-- [ ] 实现1–8端点校验与深拷贝、固定节点顺序、本机快捷及增删/上下移表单。
-- [ ] pnpm test/typecheck/build通过，记录结果。
+- [x] 先写多入口保存重载顺序/拒非法URL/secret白名单、本机按钮去重和入口移动测试，pnpm test验证红。
+- [x] 实现1–8端点校验与深拷贝、固定节点顺序、本机快捷及增删/上下移表单。
+- [x] pnpm test/typecheck/build通过，记录结果。
 
 ### Task 2: 原生有序探测/打开
 **Files:** src-tauri/src/lib.rs,src-tauri/src/endpoints.rs,src-tauri/Cargo.toml,src-tauri/Cargo.lock
 **Interfaces:** open_node(window,app,record,token)->{generation:u64,endpointIndex:usize}；复用open_connection单入口命令并保留来源检查。
-- [ ] 写真实本地HTTP探针超时/401/500/重定向不跟随/按顺序成功停止测试及原生整表校验，cargo test观察红。
-- [ ] 实现native probe和入口顺序循环，清理失败SSH，已有窗口使用存储active index；状态仅发本地shell，token仅成功入口打开。
-- [ ] Rust全套、TS全套/typecheck/build通过。
+- [x] 写真实本地HTTP探针超时/401/500/重定向不跟随/按顺序成功停止测试及原生整表校验，cargo test观察红。
+- [x] 实现native probe和入口顺序循环，清理失败SSH，已有窗口使用存储active index；状态仅发本地shell，token仅成功入口打开。
+- [x] Rust全套、TS全套/typecheck/build通过。
 
 ### Task 3: macOS测试包与真实窗口验收
 **Files:** package.json,src-tauri/Cargo.toml,src-tauri/tauri.conf.json,docs/operations/local-macos.md
-- [ ] 独立只读整体审查并修阻断问题，记录边界。
-- [ ] 版本0.3.0仅本机macOSarm64构建，ZIP/sha，实际运行新壳测试本机快捷/入口保存和第一不可达第二可达/活动窗口保持/关闭重开。
-- [ ] 更新操作说明并交付macOS包，保持独立分支供体验迭代，不触发其他平台。
+- [x] 独立只读整体审查并修阻断问题，记录边界。
+- [x] 版本0.3.0仅本机macOSarm64构建，ZIP/sha，实际运行新壳测试本机快捷/入口保存和第一不可达第二可达/活动窗口保持/关闭重开。
+- [x] 更新操作说明并交付macOS包，保持独立分支供体验迭代，不触发其他平台。
