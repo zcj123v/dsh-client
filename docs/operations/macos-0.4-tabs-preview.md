@@ -21,4 +21,4 @@
 - 前端 `pnpm test`：8个文件、36项通过；`pnpm typecheck` 和 `pnpm build` 通过。Rust library：26项通过、2项既有显式忽略（仅 `.13` SSH live route 与其 fixture launcher）。另有原生会话代际、关闭取消、来源权限和固定56logicalpx布局测试。
 - 独立只读审查未发现 Critical / Important；标签关闭状态现同步回节点管理列表。非macOS路径使用稳定窗口API，但本次没有构建或发布其他平台。
 - **`.13` 实机安装（2026-11-17）**：主机 `zcj123vdeMacBook-Air.local`，arm64。安装路径 `~/Applications/DSH Client.app`；0.3.0旧APP完整备份 `~/Applications/DSH Client-0.3.0-backup-20261117.app`。新APP Plist版本0.4.0，bundle ID保持 `com.zcj.dshclient`，运行PID `99714`，安装二进制哈希与本机最终包内 `b03d3a896340ae6bf7dfd4f5fde3b221d596cf6ae624020b0a656f2189034374` 一致。第一次安装的0.4.0预览包另保留在 `~/Applications/DSH Client-0.4.0-intermediate-20261117.app`（辅助回滚）；最终包更新前已正常退出首个客户端，检查无活动SSH转发，然后重新安装并启动。更新前后 `.13` 的 `127.0.0.1:3080` DSH worker均为PID `91076`；无服务重启、无自启注册。
-- **用户界面反馈待 `.13` 实际试用**：构建机系统屏幕截图全黑、原生窗口无障碍树不可寻址；尚未证明新版界面显示、点击或窗口生命周期效果。安装与进程启动有远端证据，但登录、tab保留、Dock恢复、SSH重试和业务体验仍未验证。若不满意，退出0.4.0并用上述备份完整回滚。
+- **`.13` 窗口采集限制**：远程CoreGraphics枚举仅返回一个 DSH Client on-screen窗口项，owner PID99714、bounds约131×163 point、title为空；`screencapture -l`无法创建截图。此信息可能是窗口报告异常或系统采集限制，单凭它不能断言APP渲染正常/错误。需要用户肉眼确认是否为完整管理页并能看见顶部标签栏；截图采集失败不是GUI验收通过。
