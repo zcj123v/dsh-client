@@ -82,6 +82,9 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .native-tab-close:hover { color: #f18e8e; background: #2c1c1e; }
 .native-tab-new { flex: 0 0 auto; width: 30px; height: 28px; margin-bottom: 8px; padding: 0; border: 1px dashed #3a4c4d; border-radius: 6px; color: #9fc3b8; background: transparent; font-size: 16px; line-height: 1; }
 .native-tab-new:hover { border-color: #6cd0b5; color: #c8eee3; }
+.native-tab-sync-error { position: fixed; top: 56px; right: 0; left: 0; z-index: 55; display: flex; justify-content: center; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid #5a3636; background: #2a1b1d; color: #f0b7b7; font-size: 12px; }
+.native-tab-sync-error button { flex: 0 0 auto; padding: 5px 10px; border: 1px solid #7a4a4a; border-radius: 4px; color: #f3c9c9; background: #3a2426; font-size: 12px; }
+.native-tab-sync-error button:hover { background: #4a2e30; }
 .tab-chooser-backdrop { position: fixed; top: 56px; right: 0; bottom: 0; left: 0; z-index: 50; display: flex; justify-content: center; align-items: flex-start; padding: 9vh 16px 16px; background: rgba(8, 11, 12, .6); }
 .tab-chooser { width: min(500px, 94vw); padding: 18px; border: 1px solid #2f474a; background: #141b1d; box-shadow: 0 24px 80px rgba(0, 0, 0, .45); }
 .tab-chooser-title { margin: 0 0 6px; color: #dff2ea; font-size: 15px; font-weight: 700; }

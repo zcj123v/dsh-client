@@ -13,7 +13,15 @@ const harness = vi.hoisted(() => {
     invokes: [] as Array<{ cmd: string; args: Record<string, unknown> | undefined }>,
     snapshot: { tabs: [], activeId: null } as HarnessSnapshot,
     events: {} as Record<string, ((event: { payload: unknown }) => void) | undefined>,
+    hold: new Set<string>(),
+    resolvers: new Map<string, Array<(value: unknown) => void>>(),
+    rejectNext: new Set<string>(),
     emit: (name: string, payload: unknown) => { h.events[name]?.({ payload }) },
+    release: (cmd: string, value: unknown) => {
+      const pending = h.resolvers.get(cmd) ?? []
+      h.resolvers.set(cmd, [])
+      for (const resolve of pending) resolve(value)
+    },
   }
   return h
 })
@@ -22,7 +30,21 @@ vi.mock('@tauri-apps/api/core', () => ({
   isTauri: () => true,
   invoke: async (cmd: string, args?: Record<string, unknown>) => {
     harness.invokes.push({ cmd, args })
-    if (cmd === 'list_tabs' || cmd === 'switch_tab' || cmd === 'close_tab') return JSON.parse(JSON.stringify(harness.snapshot)) as typeof harness.snapshot
+    if (harness.rejectNext.has(cmd)) {
+      harness.rejectNext.delete(cmd)
+      throw new Error('native-sync-broken')
+    }
+    if (cmd === 'list_tabs' || cmd === 'switch_tab' || cmd === 'close_tab') {
+      if (harness.hold.has(cmd)) {
+        harness.hold.delete(cmd)
+        return new Promise(resolve => {
+          const pending = harness.resolvers.get(cmd) ?? []
+          pending.push(resolve)
+          harness.resolvers.set(cmd, pending)
+        })
+      }
+      return JSON.parse(JSON.stringify(harness.snapshot)) as typeof harness.snapshot
+    }
     if (cmd === 'open_node') return { generation: 7, endpointIndex: 0 }
     if (cmd === 'close_connection' || cmd === 'delete_connection') return null
     throw new Error(`unexpected invoke ${cmd}`)
@@ -53,6 +75,9 @@ beforeEach(() => {
   harness.invokes = []
   harness.snapshot = { tabs: [], activeId: null }
   harness.events = {}
+  harness.hold.clear()
+  harness.resolvers.clear()
+  harness.rejectNext.clear()
   localStorage.clear()
   Object.defineProperty(window.navigator, 'userAgent', { value: MAC_UA, configurable: true })
 })
@@ -188,4 +213,65 @@ it('new node action in the chooser closes it and focuses the name field', async 
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: '新增节点' })) })
   expect(screen.queryByRole('dialog', { name: '选择节点' })).toBeNull()
   expect(screen.getByLabelText('显示名称')).toBe(document.activeElement)
+})
+
+it('a slower initial list_tabs result cannot overwrite a newer tabs-changed event', async () => {
+  localStorage.setItem('dsh-client.connections.v1', JSON.stringify([nodeA]))
+  harness.hold.add('list_tabs')
+  await renderApp()
+  await act(async () => { harness.emit('tabs-changed', { tabs: [], activeId: null }) })
+  await act(async () => { harness.release('list_tabs', { tabs: [{ id: nodeA.id, name: 'Air', state: 'ready', generation: 9 }], activeId: nodeA.id }) })
+  expect(screen.queryByRole('tab', { name: /Air/ })).toBeNull()
+})
+
+it('a stale switch_tab result cannot overwrite a newer tabs-changed event', async () => {
+  localStorage.setItem('dsh-client.connections.v1', JSON.stringify([nodeA]))
+  harness.snapshot = { tabs: [{ id: nodeA.id, name: 'Air', state: 'ready', generation: 1 }], activeId: null }
+  await renderApp()
+  harness.hold.add('switch_tab')
+  await act(async () => { fireEvent.click(screen.getByRole('tab', { name: /Air/ })) })
+  await act(async () => { harness.emit('tabs-changed', { tabs: [{ id: nodeA.id, name: 'Air', state: 'ready', generation: 1 }], activeId: nodeA.id }) })
+  await act(async () => { harness.release('switch_tab', { tabs: [{ id: nodeA.id, name: 'Air', state: 'ready', generation: 1 }], activeId: null }) })
+  expect(screen.getByRole('tab', { name: /Air/ }).getAttribute('aria-selected')).toBe('true')
+})
+
+it('a stale close_tab result cannot overwrite a newer tabs-changed event', async () => {
+  localStorage.setItem('dsh-client.connections.v1', JSON.stringify([nodeA, nodeB]))
+  harness.snapshot = {
+    tabs: [
+      { id: nodeA.id, name: 'Air', state: 'ready', generation: 1 },
+      { id: nodeB.id, name: 'k8s', state: 'ready', generation: 2 },
+    ],
+    activeId: nodeB.id,
+  }
+  await renderApp()
+  harness.hold.add('close_tab')
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: '关闭标签 k8s' })) })
+  await act(async () => { harness.emit('tabs-changed', { tabs: [{ id: nodeA.id, name: 'Air', state: 'ready', generation: 1 }], activeId: nodeA.id }) })
+  await act(async () => {
+    harness.release('close_tab', {
+      tabs: [
+        { id: nodeA.id, name: 'Air', state: 'ready', generation: 1 },
+        { id: nodeB.id, name: 'k8s', state: 'ready', generation: 2 },
+      ],
+      activeId: nodeB.id,
+    })
+  })
+  expect(screen.queryByRole('tab', { name: /k8s/ })).toBeNull()
+  expect(screen.getByRole('tab', { name: /Air/ }).getAttribute('aria-selected')).toBe('true')
+})
+
+it('surfaces a fixed sync error with a list_tabs retry when a tab command fails, without raw native errors', async () => {
+  localStorage.setItem('dsh-client.connections.v1', JSON.stringify([nodeA]))
+  harness.snapshot = { tabs: [{ id: nodeA.id, name: 'Air', state: 'ready', generation: 1 }], activeId: nodeA.id }
+  await renderApp()
+  harness.rejectNext.add('switch_tab')
+  await act(async () => { fireEvent.click(screen.getByRole('tab', { name: /节点管理/ })) })
+  const alert = screen.getByRole('alert')
+  expect(alert.textContent).toContain('标签状态同步失败')
+  expect(document.body.textContent).not.toContain('native-sync-broken')
+  await act(async () => { fireEvent.click(within(alert).getByRole('button', { name: '重试同步' })) })
+  expect(invoked('list_tabs')).toHaveLength(2)
+  await act(async () => { })
+  expect(screen.queryByRole('alert')).toBeNull()
 })

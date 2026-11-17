@@ -205,6 +205,12 @@ function App() {
   return (
     <>
       {nativeTabsEnabled && <TabBar snapshot={tabs.snapshot} onSelect={selectTab} onManager={showManager} onClose={closeTabFromBar} onNew={showChooser} />}
+      {nativeTabsEnabled && tabs.syncFailed && (
+        <div className="native-tab-sync-error" role="alert">
+          <span>标签状态同步失败，标签栏可能已过期</span>
+          <button type="button" onClick={tabs.retrySync}>重试同步</button>
+        </div>
+      )}
       {nativeTabsEnabled && chooserOpen && <TabChooser connections={connections} openTabIds={openTabIds} onChoose={record => { setChooserOpen(false); void openConnection(record) }} onNewNode={startNewNode} onDismiss={() => setChooserOpen(false)} />}
       <main className={nativeTabsEnabled ? 'app-shell with-tabs' : 'app-shell'}>
         <header className="topbar">
