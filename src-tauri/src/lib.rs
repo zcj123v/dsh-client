@@ -5,6 +5,8 @@ mod endpoints;
 mod policy;
 #[cfg(not(target_os = "android"))]
 mod recovery;
+#[cfg(target_os = "macos")]
+mod tabs;
 use policy::*;
 use serde::Deserialize;
 #[cfg(not(target_os = "android"))]
@@ -19,11 +21,13 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tauri::WebviewWindow;
+use tauri::Webview;
+#[cfg(not(target_os = "android"))]
+use tauri::WebviewUrl;
+#[cfg(not(target_os = "macos"))]
+use tauri::WebviewWindowBuilder;
 #[cfg(not(target_os = "android"))]
 use tauri::{Emitter, Manager};
-#[cfg(not(target_os = "android"))]
-use tauri::{WebviewUrl, WebviewWindowBuilder};
 #[cfg(not(target_os = "android"))]
 use tauri_plugin_opener::OpenerExt;
 
@@ -118,24 +122,43 @@ struct Connections {
     window_tunnels: Mutex<HashMap<String, WindowTunnel>>,
     tunnels: Mutex<HashMap<String, Arc<Mutex<Tunnel>>>>,
     exiting: AtomicBool,
+    #[cfg(target_os = "macos")]
+    window_hidden: AtomicBool,
     urls: Mutex<HashMap<String, tauri::Url>>,
     selected_entries: Mutex<HashMap<String, usize>>,
     opening_nodes: Mutex<std::collections::HashSet<String>>,
+    #[cfg(target_os = "macos")]
+    tabs: Mutex<tabs::TabRegistry>,
 }
 
-fn require_shell(window: &WebviewWindow) -> Result<(), String> {
+fn require_shell(window: &Webview) -> Result<(), String> {
     let url = window.url().map_err(|_| "无法验证客户端来源")?;
+    if !local_shell_identity(window.label(), window.window().label(), &url) {
+        return Err("仅本地客户端壳可调用此操作".into());
+    }
+    Ok(())
+}
+fn local_shell_identity(webview_label: &str, window_label: &str, url: &tauri::Url) -> bool {
     let local = (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
         || (["http", "https"].contains(&url.scheme()) && url.host_str() == Some("tauri.localhost"))
         || (cfg!(debug_assertions)
             && url.scheme() == "http"
             && url.host_str() == Some("localhost")
             && url.port() == Some(1420));
-    if window.label() != "main" || !local {
-        return Err("仅本地客户端壳可调用此操作".into());
-    }
-    Ok(())
+    webview_label == "main" && window_label == "main" && local
 }
+#[cfg(not(target_os = "android"))]
+fn emit_shell_event(app: &tauri::AppHandle, event: &str, payload: serde_json::Value) {
+    #[cfg(target_os = "macos")]
+    if let Some(shell) = app.get_webview("main") {
+        let _ = shell.emit(event, payload);
+    }
+    #[cfg(not(target_os = "macos"))]
+    if let Some(shell) = app.get_webview_window("main") {
+        let _ = shell.emit(event, payload);
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 fn kill_tunnel(child: &Arc<Mutex<Tunnel>>) {
     if let Ok(mut tunnel) = child.lock() {
@@ -276,7 +299,7 @@ impl Drop for OpeningNode {
 }
 #[tauri::command]
 async fn open_node(
-    window: WebviewWindow,
+    window: Webview,
     app: tauri::AppHandle,
     record: Connection,
     token: Option<String>,
@@ -312,10 +335,17 @@ async fn open_node(
             app: app.clone(),
             id: record.id.clone(),
         };
-        if app
+        #[cfg(target_os = "macos")]
+        let session = tabs::begin(&app, &record.id, &record.name)?;
+        #[cfg(target_os = "macos")]
+        let mut attempt = tabs::OpenAttempt::new(&app, session.clone());
+        #[cfg(target_os = "macos")]
+        let has_existing = app.get_webview(&format!("dsh-{}", record.id)).is_some();
+        #[cfg(not(target_os = "macos"))]
+        let has_existing = app
             .get_webview_window(&format!("dsh-{}", record.id))
-            .is_some()
-        {
+            .is_some();
+        if has_existing {
             let index = app
                 .state::<Connections>()
                 .selected_entries
@@ -325,6 +355,15 @@ async fn open_node(
                 .copied()
                 .ok_or("请关闭旧连接窗口后重试")?;
             let entry = entries.get(index).ok_or("请保存修改并关闭旧窗口后重试")?;
+            #[cfg(target_os = "macos")]
+            let generation = tabs::open_connection(
+                &app,
+                entry.connection(&record.id, &record.name),
+                token,
+                session.clone(),
+            )
+            .await?;
+            #[cfg(not(target_os = "macos"))]
             let generation = open_connection(
                 window,
                 app.clone(),
@@ -332,6 +371,10 @@ async fn open_node(
                 token,
             )
             .await?;
+            #[cfg(target_os = "macos")]
+            {
+                attempt.success()?;
+            }
             return Ok(OpenNodeResult {
                 generation,
                 endpoint_index: index,
@@ -339,30 +382,47 @@ async fn open_node(
         }
         let (index, generation) = endpoints::try_in_order(entries.len(), |index| {
             let entry = entries[index].clone();
+            #[cfg(not(target_os = "macos"))]
             let window = window.clone();
             let app = app.clone();
             let token = token.clone();
             let id = record.id.clone();
             let name = record.name.clone();
+            #[cfg(target_os = "macos")]
+            let session = session.clone();
             let request_id = request_id.clone();
             async move {
+                #[cfg(target_os = "macos")]
+                if session.cancelled.load(Ordering::SeqCst) {
+                    return Err("标签已关闭".into());
+                }
                 if app.state::<Connections>().exiting.load(Ordering::SeqCst) {
                     return Err("客户端正在退出".into());
                 }
-                if let Some(shell) = app.get_webview_window("main") {
-                    let _ = shell.emit(
-                        "node-attempt",
-                        serde_json::json!({"id":id,"requestId":request_id,"index":index}),
-                    );
-                }
+                emit_shell_event(
+                    &app,
+                    "node-attempt",
+                    serde_json::json!({"id":id,"requestId":request_id,"index":index}),
+                );
                 let probe = entry.clone();
                 tauri::async_runtime::spawn_blocking(move || probe.probe())
                     .await
                     .map_err(|_| "连接探测未完成")??;
+                #[cfg(target_os = "macos")]
+                if session.cancelled.load(Ordering::SeqCst) {
+                    return Err("标签已关闭".into());
+                }
                 if app.state::<Connections>().exiting.load(Ordering::SeqCst) {
                     return Err("客户端正在退出".into());
                 }
-                open_connection(window, app, entry.connection(&id, &name), token).await
+                #[cfg(target_os = "macos")]
+                {
+                    tabs::open_connection(&app, entry.connection(&id, &name), token, session).await
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    open_connection(window, app, entry.connection(&id, &name), token).await
+                }
             }
         })
         .await?;
@@ -370,7 +430,11 @@ async fn open_node(
             .selected_entries
             .lock()
             .map_err(|_| "入口状态不可用")?
-            .insert(record.id, index);
+            .insert(record.id.clone(), index);
+        #[cfg(target_os = "macos")]
+        {
+            attempt.success()?;
+        }
         Ok(OpenNodeResult {
             generation,
             endpoint_index: index,
@@ -380,7 +444,7 @@ async fn open_node(
 
 #[tauri::command]
 async fn open_connection(
-    window: WebviewWindow,
+    window: Webview,
     app: tauri::AppHandle,
     record: Connection,
     token: Option<String>,
@@ -394,7 +458,12 @@ async fn open_connection(
     {
         return android::open(&app, record, token).await.map(|_| 0);
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (app, record, token);
+        return Err("macOS 标签连接必须从本地节点管理器打开".into());
+    }
+    #[cfg(not(any(target_os = "android", target_os = "macos")))]
     {
         let label = format!("dsh-{}", record.id);
         let existing = app.get_webview_window(&label);
@@ -629,9 +698,7 @@ async fn open_connection(
                 if let Some(expected) = expected {
                     stop_tunnel_state(&close_app.state::<Connections>(), &close_id, Some(&expected));
                 }
-                if let Some(shell) = close_app.get_webview_window("main") {
-                    let _ = shell.emit("connection-status", serde_json::json!({"id": close_id, "state": "disconnected", "attempt": 0, "generation": generation}));
-                }
+                emit_shell_event(&close_app,"connection-status",serde_json::json!({"id":close_id,"state":"disconnected","attempt":0,"generation":generation}));
             }
         });
         if let Some(guard) = pending.as_mut() {
@@ -659,12 +726,29 @@ fn install_recovery_events(app: &tauri::AppHandle, id: &str, base: &tauri::Url) 
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    let Some(view) = app.get_webview(&format!("dsh-{id}")) else {
+        return;
+    };
+    #[cfg(not(target_os = "macos"))]
     let Some(view) = app.get_webview_window(&format!("dsh-{id}")) else {
         return;
     };
     let app = app.clone();
     let id = id.to_owned();
     let base = base.clone();
+    #[cfg(target_os = "macos")]
+    let tab_session = app
+        .state::<Connections>()
+        .tabs
+        .lock()
+        .ok()
+        .and_then(|tabs| tabs.get(&id));
+    #[cfg(target_os = "macos")]
+    let tab_generation = tab_session
+        .as_ref()
+        .map(|session| session.generation.load(Ordering::SeqCst))
+        .unwrap_or(0);
     if let Ok(mut tunnel) = child.lock() {
         let generation = tunnel.generation;
         tunnel.callback = Some(Arc::new(move |status, attempt| {
@@ -684,9 +768,17 @@ fn install_recovery_events(app: &tauri::AppHandle, id: &str, base: &tauri::Url) 
             if !active {
                 return;
             }
-            if let Some(shell) = app.get_webview_window("main") {
-                let _ = shell.emit("connection-status", serde_json::json!({"id": id, "state": status, "attempt": attempt, "generation": generation}));
+            if status == "failed" {
+                #[cfg(target_os = "macos")]
+                if let Some(session) = tab_session.as_ref() {
+                    tabs::mark_transport_failed(&app, session, tab_generation);
+                }
             }
+            emit_shell_event(
+                &app,
+                "connection-status",
+                serde_json::json!({"id":id,"state":status,"attempt":attempt,"generation":generation}),
+            );
             if status == "ready" {
                 // Capture the exact old window handle: never look up a replacement window by label.
                 let _ = view.navigate(base.clone());
@@ -732,7 +824,7 @@ fn open_external(app: &tauri::AppHandle, url: &tauri::Url) {
 }
 #[tauri::command]
 async fn close_connection(
-    window: WebviewWindow,
+    window: Webview,
     app: tauri::AppHandle,
     id: String,
 ) -> Result<(), String> {
@@ -742,7 +834,11 @@ async fn close_connection(
     {
         return android::call(&app, "close", serde_json::json!({ "id": id })).await;
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "macos")]
+    {
+        return tabs::close(&app, &id);
+    }
+    #[cfg(not(any(target_os = "android", target_os = "macos")))]
     {
         if let Some(view) = app.get_webview_window(&format!("dsh-{id}")) {
             view.close().map_err(|_| "无法关闭旧连接窗口")?;
@@ -758,7 +854,7 @@ async fn close_connection(
 }
 #[tauri::command]
 async fn delete_connection(
-    window: WebviewWindow,
+    window: Webview,
     app: tauri::AppHandle,
     id: String,
 ) -> Result<(), String> {
@@ -768,7 +864,11 @@ async fn delete_connection(
     {
         return android::call(&app, "delete", serde_json::json!({ "id": id })).await;
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "macos")]
+    {
+        return tabs::delete(&app, &id);
+    }
+    #[cfg(not(any(target_os = "android", target_os = "macos")))]
     {
         let label = format!("dsh-{id}");
         let view = if let Some(view) = app.get_webview_window(&label) {
@@ -811,6 +911,64 @@ async fn delete_connection(
         Ok(())
     }
 }
+#[tauri::command]
+fn list_tabs(window: Webview, app: tauri::AppHandle) -> Result<tabs_api::Snapshot, String> {
+    require_shell(&window)?;
+    tabs_api::snapshot(&app)
+}
+#[tauri::command]
+fn switch_tab(
+    window: Webview,
+    app: tauri::AppHandle,
+    id: Option<String>,
+) -> Result<tabs_api::Snapshot, String> {
+    require_shell(&window)?;
+    tabs_api::switch(&app, id)
+}
+#[tauri::command]
+async fn close_tab(
+    window: Webview,
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<tabs_api::Snapshot, String> {
+    require_shell(&window)?;
+    connection_id(&id)?;
+    tabs_api::close(&app, &id)
+}
+#[cfg(target_os = "macos")]
+mod tabs_api {
+    use super::*;
+    pub type Snapshot = tabs::TabSnapshot;
+    pub fn snapshot(app: &tauri::AppHandle) -> Result<Snapshot, String> {
+        tabs::snapshot(app)
+    }
+    pub fn switch(app: &tauri::AppHandle, id: Option<String>) -> Result<Snapshot, String> {
+        app.state::<Connections>()
+            .tabs
+            .lock()
+            .map_err(|_| "标签状态不可用")?
+            .activate(id.as_deref())?;
+        tabs::apply_visibility(app)?;
+        snapshot(app)
+    }
+    pub fn close(app: &tauri::AppHandle, id: &str) -> Result<Snapshot, String> {
+        tabs::close(app, id)?;
+        snapshot(app)
+    }
+}
+#[cfg(not(target_os = "macos"))]
+mod tabs_api {
+    pub type Snapshot = serde_json::Value;
+    pub fn snapshot(_app: &tauri::AppHandle) -> Result<Snapshot, String> {
+        Err("当前平台尚未提供标签预览".into())
+    }
+    pub fn switch(app: &tauri::AppHandle, _id: Option<String>) -> Result<Snapshot, String> {
+        snapshot(app)
+    }
+    pub fn close(app: &tauri::AppHandle, _id: &str) -> Result<Snapshot, String> {
+        snapshot(app)
+    }
+}
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
@@ -821,19 +979,45 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            list_tabs,
+            switch_tab,
+            close_tab,
             open_node,
             open_connection,
             delete_connection,
             close_connection
         ])
+        .setup(|app| {
+            #[cfg(target_os = "macos")]
+            tabs::install(app)?;
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("无法启动 DSH Client")
         .run(|_app, _event| {
+            #[cfg(target_os = "macos")]
+            if matches!(_event, tauri::RunEvent::Reopen { .. }) {
+                tabs::reveal(_app);
+            }
             #[cfg(not(target_os = "android"))]
             if matches!(_event, tauri::RunEvent::Exit) {
                 stop_all(&_app.state::<Connections>());
             }
         });
+}
+
+#[cfg(test)]
+mod shell_identity_tests {
+    use super::*;
+    #[test]
+    fn only_the_local_main_webview_has_shell_authority() {
+        let local = tauri::Url::parse("tauri://localhost/").unwrap();
+        let remote = tauri::Url::parse("https://dsh.example/").unwrap();
+        assert!(local_shell_identity("main", "main", &local));
+        assert!(!local_shell_identity("dsh-node", "main", &local));
+        assert!(!local_shell_identity("main", "main", &remote));
+        assert!(!local_shell_identity("main", "other", &local));
+    }
 }
 
 #[cfg(all(test, unix))]
