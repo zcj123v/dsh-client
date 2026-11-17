@@ -1,11 +1,11 @@
 import { displayConnection, type ConnectionRecord } from './connection-model'
-import type { TabsSnapshot } from './native-tabs'
+import type { NativeTab, NativeTabState, TabsSnapshot } from './native-tabs'
 
 export const TAB_BAR_HEIGHT_CSS_PX = 56
 
 interface TabBarProps {
   snapshot: TabsSnapshot | null
-  onSelect: (id: string) => void
+  onSelect: (tab: NativeTab) => void
   onManager: () => void
   onClose: (id: string, name: string) => void
   onNew: () => void
@@ -21,7 +21,7 @@ export function TabBar({ snapshot, onSelect, onManager, onClose, onNew }: TabBar
       </button>
       {(snapshot?.tabs ?? []).map(tab => (
         <div className={`native-tab-item${activeId === tab.id ? ' selected' : ''}`} key={tab.id}>
-          <button type="button" role="tab" aria-selected={activeId === tab.id} className={`native-tab state-${tab.state}`} onClick={() => onSelect(tab.id)}>
+          <button type="button" role="tab" aria-selected={activeId === tab.id} className={`native-tab state-${tab.state}`} onClick={() => onSelect(tab)}>
             <span className="native-tab-name">{tab.name || tab.id}</span>
             {tab.state === 'opening' && <span className="native-tab-state">连接中</span>}
             {tab.state === 'failed' && <span className="native-tab-state">失败</span>}
@@ -36,27 +36,35 @@ export function TabBar({ snapshot, onSelect, onManager, onClose, onNew }: TabBar
 
 interface TabChooserProps {
   connections: ConnectionRecord[]
-  openTabIds: Set<string>
+  /** Native registry tab states by node id: ready tabs switch, failed tabs retry, opening tabs are blocked. */
+  tabStates: Map<string, NativeTabState>
   onChoose: (record: ConnectionRecord) => void
   onNewNode: () => void
   onDismiss: () => void
 }
 
-export function TabChooser({ connections, openTabIds, onChoose, onNewNode, onDismiss }: TabChooserProps) {
+export function TabChooser({ connections, tabStates, onChoose, onNewNode, onDismiss }: TabChooserProps) {
   return (
     <div className="tab-chooser-backdrop" onClick={onDismiss}>
       <div className="tab-chooser" role="dialog" aria-label="选择节点" onClick={event => event.stopPropagation()}>
         <p className="tab-chooser-title">打开节点标签</p>
-        <p className="tab-chooser-hint">选择已保存节点打开标签；已有标签的节点会直接切换，不重新连接。</p>
+        <p className="tab-chooser-hint">选择已保存节点打开标签；已就绪的标签直接切换，失败的可重试，不重新加载已打开页面。</p>
         <div className="tab-chooser-list">
           {connections.length === 0
             ? <p className="tab-chooser-empty">还没有已保存节点，先新增一个。</p>
-            : connections.map(record => (
-              <button type="button" key={record.id} className="tab-chooser-node" onClick={() => onChoose(record)}>
-                <strong>{record.name}</strong>
-                <span>{openTabIds.has(record.id) ? '已打开 · 点击切换' : displayConnection(record)}</span>
-              </button>
-            ))}
+            : connections.map(record => {
+              const state = tabStates.get(record.id)
+              const hint = state === 'ready' ? '已打开 · 点击切换'
+                : state === 'opening' ? '连接中 · 请稍候'
+                  : state === 'failed' ? '连接失败 · 点击重试'
+                    : displayConnection(record)
+              return (
+                <button type="button" key={record.id} className={`tab-chooser-node${state === 'failed' ? ' failed' : ''}`} disabled={state === 'opening'} onClick={() => onChoose(record)}>
+                  <strong>{record.name}</strong>
+                  <span>{hint}</span>
+                </button>
+              )
+            })}
         </div>
         <div className="tab-chooser-actions">
           <button type="button" className="secondary-button tab-chooser-new" onClick={onNewNode}>新增节点</button>

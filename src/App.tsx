@@ -7,7 +7,7 @@ import { connectionEndpoints, createConnectionRecord, displayConnection, type Co
 import { EndpointEditor, blankEndpoint } from './EndpointEditor'
 import { ConnectionStore } from './connection-store'
 import { connectionCapabilities } from './platform-capabilities'
-import { supportsNativeTabs } from './native-tabs'
+import { supportsNativeTabs, type NativeTab, type NativeTabState } from './native-tabs'
 import { useNativeTabs } from './use-native-tabs'
 import { TabBar, TabChooser } from './TabShell'
 
@@ -49,11 +49,24 @@ function App() {
   const tabsRef = useRef(tabs)
   tabsRef.current = tabs
 
-  const openTabIds = new Set((tabs.snapshot?.tabs ?? []).map(tab => tab.id))
+  // Native registry states by node id. Only 'ready' means a live child view exists:
+  // 'opening' is an in-flight attempt (duplicate opens blocked) and 'failed' is a
+  // registry placeholder with no child (must retry via open_node, never switch).
+  const tabStates = new Map<string, NativeTabState>((tabs.snapshot?.tabs ?? []).map(tab => [tab.id, tab.state] as const))
 
   function selectTab(id: string): void { tabsRef.current.switchTab(id) }
 
   function closeTabFromBar(id: string): void { tabsRef.current.closeTab(id) }
+
+  function handleTabSelect(tab: NativeTab): void {
+    if (tab.state === 'opening') return
+    if (tab.state === 'failed') {
+      const record = connections.find(item => item.id === tab.id)
+      if (record) void openConnection(record)
+      return
+    }
+    selectTab(tab.id)
+  }
 
   function showManager(): void {
     setChooserOpen(false)
@@ -139,14 +152,23 @@ function App() {
 
   async function openConnection(record: ConnectionRecord): Promise<void> {
     const explicitToken = tokens[record.id]?.trim() || null
-    // Native tabs: an existing tab means the child WebView is alive — switching only;
-    // an explicit token is the single documented reason to re-authenticate via open_node.
-    if (nativeTabsEnabled && !explicitToken && openTabIds.has(record.id)) {
-      setError('')
-      setNotice('')
-      setStatuses(current => ({ ...current, [record.id]: '已有标签 · 已切换回该页面' }))
-      selectTab(record.id)
-      return
+    // Native tabs: 'ready' means the child WebView is alive — switching only. 'opening'
+    // blocks duplicate attempts. 'failed' (or no tab) has no child to switch to, so it
+    // falls through to open_node retry; an explicit token is the single documented
+    // reason to re-authenticate a live tab via open_node.
+    if (nativeTabsEnabled && !explicitToken) {
+      const tabState = tabStates.get(record.id)
+      if (tabState === 'ready') {
+        setError('')
+        setNotice('')
+        setStatuses(current => ({ ...current, [record.id]: '已有标签 · 已切换回该页面' }))
+        selectTab(record.id)
+        return
+      }
+      if (tabState === 'opening') {
+        setStatuses(current => ({ ...current, [record.id]: '正在连接… 请稍候' }))
+        return
+      }
     }
     if (busy) return
     setBusy(true)
@@ -204,14 +226,14 @@ function App() {
 
   return (
     <>
-      {nativeTabsEnabled && <TabBar snapshot={tabs.snapshot} onSelect={selectTab} onManager={showManager} onClose={closeTabFromBar} onNew={showChooser} />}
+      {nativeTabsEnabled && <TabBar snapshot={tabs.snapshot} onSelect={handleTabSelect} onManager={showManager} onClose={closeTabFromBar} onNew={showChooser} />}
       {nativeTabsEnabled && tabs.syncFailed && (
         <div className="native-tab-sync-error" role="alert">
           <span>标签状态同步失败，标签栏可能已过期</span>
           <button type="button" onClick={tabs.retrySync}>重试同步</button>
         </div>
       )}
-      {nativeTabsEnabled && chooserOpen && <TabChooser connections={connections} openTabIds={openTabIds} onChoose={record => { setChooserOpen(false); void openConnection(record) }} onNewNode={startNewNode} onDismiss={() => setChooserOpen(false)} />}
+      {nativeTabsEnabled && chooserOpen && <TabChooser connections={connections} tabStates={tabStates} onChoose={record => { setChooserOpen(false); void openConnection(record) }} onNewNode={startNewNode} onDismiss={() => setChooserOpen(false)} />}
       <main className={nativeTabsEnabled ? 'app-shell with-tabs' : 'app-shell'}>
         <header className="topbar">
         <div>
@@ -239,7 +261,7 @@ function App() {
                   <small role="status">{statuses[record.id] ?? '未打开'}</small>
                   <input aria-label={`${record.name} 一次性 token`} type="password" autoComplete="off" placeholder="首次登录 / 认证失效：粘贴 token（不保存）" value={tokens[record.id] ?? ''} onChange={event => { const value = event.currentTarget.value; setTokens(current => ({ ...current, [record.id]: value })) }} />
                 </div>
-                <div className="connection-actions"><button disabled={busy} className="primary-button compact" onClick={() => void openConnection(record)}>打开 / 重试</button><button disabled={busy} className="icon-button" title="编辑连接" onClick={() => editConnection(record)}>✎</button><button disabled={busy} className="icon-button" title="删除连接与浏览数据" onClick={() => void removeConnection(record)}>×</button></div>
+                <div className="connection-actions"><button disabled={busy || (nativeTabsEnabled && tabStates.get(record.id) === 'opening' && !tokens[record.id]?.trim())} className="primary-button compact" onClick={() => void openConnection(record)}>打开 / 重试</button><button disabled={busy} className="icon-button" title="编辑连接" onClick={() => editConnection(record)}>✎</button><button disabled={busy} className="icon-button" title="删除连接与浏览数据" onClick={() => void removeConnection(record)}>×</button></div>
               </article>)}
             </div>
           )}

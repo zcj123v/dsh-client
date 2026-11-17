@@ -275,3 +275,33 @@ it('surfaces a fixed sync error with a list_tabs retry when a tab command fails,
   await act(async () => { })
   expect(screen.queryByRole('alert')).toBeNull()
 })
+
+it('retries a failed tab through open_node from the bar, chooser and management page instead of switching to a missing child', async () => {
+  localStorage.setItem('dsh-client.connections.v1', JSON.stringify([nodeA]))
+  harness.snapshot = { tabs: [{ id: nodeA.id, name: 'Air', state: 'failed', generation: 1 }], activeId: null }
+  await renderApp()
+  await act(async () => { fireEvent.click(screen.getByRole('tab', { name: /Air/ })) })
+  expect(invoked('open_node')).toHaveLength(1)
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: '新建连接标签' })) })
+  await act(async () => { fireEvent.click(within(screen.getByRole('dialog', { name: '选择节点' })).getByRole('button', { name: /Air/ })) })
+  expect(invoked('open_node')).toHaveLength(2)
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: '打开 / 重试' })) })
+  expect(invoked('open_node')).toHaveLength(3)
+  expect(invoked('switch_tab').every(entry => entry.args?.id !== nodeA.id)).toBe(true)
+})
+
+it('blocks duplicate opens while a tab is opening', async () => {
+  localStorage.setItem('dsh-client.connections.v1', JSON.stringify([nodeA]))
+  harness.snapshot = { tabs: [{ id: nodeA.id, name: 'Air', state: 'opening', generation: 1 }], activeId: nodeA.id }
+  await renderApp()
+  await act(async () => { fireEvent.click(screen.getByRole('tab', { name: /Air/ })) })
+  expect(invoked('open_node')).toHaveLength(0)
+  expect(invoked('switch_tab').every(entry => entry.args?.id !== nodeA.id)).toBe(true)
+  expect((screen.getByRole('button', { name: '打开 / 重试' }) as HTMLButtonElement).disabled).toBe(true)
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: '新建连接标签' })) })
+  const chooserNode = within(screen.getByRole('dialog', { name: '选择节点' })).getByRole('button', { name: /Air/ }) as HTMLButtonElement
+  expect(chooserNode.textContent).toContain('连接中')
+  expect(chooserNode.disabled).toBe(true)
+  await act(async () => { fireEvent.click(chooserNode) })
+  expect(invoked('open_node')).toHaveLength(0)
+})

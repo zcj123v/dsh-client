@@ -92,6 +92,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .tab-chooser-list { display: grid; gap: 8px; max-height: 46vh; overflow-y: auto; }
 .tab-chooser-node { display: grid; gap: 4px; padding: 12px 14px; border: 1px solid #35494b; border-radius: 6px; color: inherit; background: #182126; text-align: left; }
 .tab-chooser-node:hover { border-color: #6cd0b5; }
+.tab-chooser-node.failed span { color: #e8a4a4; }
 .tab-chooser-node strong { color: #e8f3ee; font-size: 13px; }
 .tab-chooser-node span { overflow: hidden; color: #819092; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .tab-chooser-empty { margin: 0; padding: 18px 6px; color: #899899; font-size: 13px; text-align: center; }
