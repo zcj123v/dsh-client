@@ -25,3 +25,11 @@ ssh -F ~/.ssh/dsh-fleet-config dsh-air 'shasum -a 256 /tmp/DSH-Client-arm64.zip'
 ## 回滚
 
 关闭客户端，保留失败 APP 供检查，恢复安装前留存的旧 APP 后 open。只删除经过核实的客户端路径；不删除 .dsh、worker Profile、凭据或会话。具体安装版本、哈希、PID 和结果见 DSH 主仓验收记录。
+
+## 2026-11-17 升级到 0.3.0 macOS 预览版
+
+用户明确要求升级`.13`后，核对主机 `zcj123vdeMacBook-Air.local`、arm64、原安装0.1.1。传输已验证的0.3.0 ZIP，远端SHA256与本机一致：`ce74b92ef06105cb6e152a102b526dd5e77e30c7a87b5fc9ad17f400387eb9d0`。原客户端当时未运行，无需强制终止。
+
+原APP完整保留在 `~/Applications/DSH Client-0.1.1-backup-20261117.app`，新APP安装到 `~/Applications/DSH Client.app`。安装后Plist版本0.3.0，Mach-O SHA256 `f19e0f4e3522adf1cbd42b1d2027206de9cdf65024b364486ed5c5f3bdc62a8d` 与包内一致，open启动后核对精确可执行路径，客户端PID83429。更新前后DSH监听 `127.0.0.1:3080` 均为原PID10813，未重启Host、未注册自启、未改节点连接或认证数据。
+
+本次证明安装与进程启动，未远程验证该机窗口画面、登录或LAN/WG实际业务；用户可在0.3.0的“添加本机 DSH”和节点入口列表体验。包仍为macOS14+ arm64未签名预览；其他平台未打包。需要回滚时关闭0.3.0，保留它供排查，再恢复上述0.1.1备份。
