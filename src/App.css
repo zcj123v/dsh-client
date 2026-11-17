@@ -64,3 +64,35 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .connection-meta .entry-chain { color: #a5d7c8; font: 12px/1.5 -apple-system, sans-serif; white-space: normal; }
 .connections-panel { align-self: start; position: sticky; top: 20px; }
 @media (max-width: 840px) { .connections-panel { position: static; } }
+
+/* Native macOS tab shell: fixed 56 CSS px bar; the Rust child webview offset must match this height. */
+.native-tabbar { position: fixed; top: 0; left: 0; right: 0; z-index: 60; display: flex; align-items: flex-end; gap: 4px; height: 56px; padding: 0 10px 0 12px; background: rgba(14, 19, 21, .99); border-bottom: 1px solid #2b383a; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
+.app-shell.with-tabs { padding-top: 84px; }
+.native-tab { display: inline-flex; align-items: center; gap: 8px; max-width: 230px; height: 34px; margin-bottom: 5px; padding: 0 10px; border: 1px solid transparent; border-bottom: 0; border-radius: 7px 7px 0 0; color: #93a5a6; background: transparent; font-size: 12.5px; }
+.native-tab:hover { color: #c9d8d6; }
+.native-tab-icon { font-size: 13px; line-height: 1; }
+.native-tab-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.native-tab-state { flex: 0 0 auto; color: #8fb8ab; font-size: 10px; }
+.native-tab-item { display: inline-flex; align-items: flex-end; flex: 0 0 auto; }
+.native-tab-item.selected .native-tab { color: #e2f2ec; background: #1b2a2c; border-color: #35504f; }
+.native-tab-item.selected .native-tab-close { color: #9db3ae; }
+.native-tab.state-failed .native-tab-name { color: #eda9a9; }
+.native-tab.state-failed .native-tab-state { color: #e8a4a4; }
+.native-tab-close { flex: 0 0 auto; width: 20px; height: 20px; margin: 0 0 13px 2px; padding: 0; border: 0; border-radius: 4px; color: #6d7a7c; background: transparent; font-size: 14px; line-height: 1; }
+.native-tab-close:hover { color: #f18e8e; background: #2c1c1e; }
+.native-tab-new { flex: 0 0 auto; width: 30px; height: 28px; margin-bottom: 8px; padding: 0; border: 1px dashed #3a4c4d; border-radius: 6px; color: #9fc3b8; background: transparent; font-size: 16px; line-height: 1; }
+.native-tab-new:hover { border-color: #6cd0b5; color: #c8eee3; }
+.tab-chooser-backdrop { position: fixed; top: 56px; right: 0; bottom: 0; left: 0; z-index: 50; display: flex; justify-content: center; align-items: flex-start; padding: 9vh 16px 16px; background: rgba(8, 11, 12, .6); }
+.tab-chooser { width: min(500px, 94vw); padding: 18px; border: 1px solid #2f474a; background: #141b1d; box-shadow: 0 24px 80px rgba(0, 0, 0, .45); }
+.tab-chooser-title { margin: 0 0 6px; color: #dff2ea; font-size: 15px; font-weight: 700; }
+.tab-chooser-hint { margin: 0 0 14px; color: #7f8e90; font-size: 12px; line-height: 1.6; }
+.tab-chooser-list { display: grid; gap: 8px; max-height: 46vh; overflow-y: auto; }
+.tab-chooser-node { display: grid; gap: 4px; padding: 12px 14px; border: 1px solid #35494b; border-radius: 6px; color: inherit; background: #182126; text-align: left; }
+.tab-chooser-node:hover { border-color: #6cd0b5; }
+.tab-chooser-node strong { color: #e8f3ee; font-size: 13px; }
+.tab-chooser-node span { overflow: hidden; color: #819092; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.tab-chooser-empty { margin: 0; padding: 18px 6px; color: #899899; font-size: 13px; text-align: center; }
+.tab-chooser-actions { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 14px; }
+.tab-chooser-cancel { padding: 8px 12px; border: 0; color: #7f8e90; background: transparent; font-size: 12px; }
+.tab-chooser-cancel:hover { color: #c9d8d6; }
+@media (max-width: 480px) { .app-shell.with-tabs { padding-top: 76px; } }

@@ -7,6 +7,9 @@ import { connectionEndpoints, createConnectionRecord, displayConnection, type Co
 import { EndpointEditor, blankEndpoint } from './EndpointEditor'
 import { ConnectionStore } from './connection-store'
 import { connectionCapabilities } from './platform-capabilities'
+import { supportsNativeTabs } from './native-tabs'
+import { useNativeTabs } from './use-native-tabs'
+import { TabBar, TabChooser } from './TabShell'
 
 const browserStorage = {
   getItem: (key: string) => window.localStorage.getItem(key),
@@ -19,6 +22,7 @@ const initialDraft: ConnectionDraft = { name: '', mode: 'direct', url: 'https://
 
 function App() {
   const capabilities = connectionCapabilities(navigator.userAgent)
+  const nativeTabsEnabled = isTauri() && supportsNativeTabs(navigator.userAgent)
   const [connections, setConnections] = useState<ConnectionRecord[]>(store.list())
   const [draft, setDraft] = useState<ConnectionDraft>(initialDraft)
   const [entries, setEntries] = useState<Endpoint[]>([blankEndpoint()])
@@ -31,6 +35,43 @@ function App() {
   const openingRequest = useRef<string | null>(null)
   const generations = useRef<Record<string, number | null>>({})
   const [editing, setEditing] = useState<ConnectionRecord | null>(null)
+  const [chooserOpen, setChooserOpen] = useState(false)
+  const nameInputRef = useRef<HTMLInputElement | null>(null)
+
+  const tabs = useNativeTabs(nativeTabsEnabled, {
+    onManager: () => { setChooserOpen(false); tabsRef.current.switchTab(null) },
+    onNew: () => { tabsRef.current.switchTab(null); setChooserOpen(true) },
+    onCloseActive: () => {
+      const active = tabsRef.current.snapshot?.activeId
+      if (active) tabsRef.current.closeTab(active)
+    },
+  })
+  const tabsRef = useRef(tabs)
+  tabsRef.current = tabs
+
+  const openTabIds = new Set((tabs.snapshot?.tabs ?? []).map(tab => tab.id))
+
+  function selectTab(id: string): void { tabsRef.current.switchTab(id) }
+
+  function closeTabFromBar(id: string): void { tabsRef.current.closeTab(id) }
+
+  function showManager(): void {
+    setChooserOpen(false)
+    tabsRef.current.switchTab(null)
+  }
+
+  function showChooser(): void {
+    tabsRef.current.switchTab(null)
+    setChooserOpen(true)
+  }
+
+  function startNewNode(): void {
+    setChooserOpen(false)
+    setEditing(null)
+    setDraft(initialDraft)
+    setEntries([blankEndpoint()])
+    nameInputRef.current?.focus()
+  }
 
   useEffect(() => {
     if (!isTauri()) return
@@ -97,12 +138,21 @@ function App() {
   }
 
   async function openConnection(record: ConnectionRecord): Promise<void> {
+    const explicitToken = tokens[record.id]?.trim() || null
+    // Native tabs: an existing tab means the child WebView is alive — switching only;
+    // an explicit token is the single documented reason to re-authenticate via open_node.
+    if (nativeTabsEnabled && !explicitToken && openTabIds.has(record.id)) {
+      setError('')
+      setNotice('')
+      setStatuses(current => ({ ...current, [record.id]: '已有标签 · 已切换回该页面' }))
+      selectTab(record.id)
+      return
+    }
     if (busy) return
     setBusy(true)
     openingRequest.current = crypto.randomUUID()
     setError('')
     setNotice('')
-    const token = tokens[record.id]?.trim() || null
     setTokens(current => ({ ...current, [record.id]: '' }))
     setCurrentEntries(current => { const next = { ...current }; delete next[record.id]; return next })
     generations.current[record.id] = null
@@ -110,8 +160,8 @@ function App() {
     try {
       if (!isTauri()) throw new Error('请在 DSH Client 应用中打开连接；浏览器页面仅用于预览')
       const result = capabilities.android
-        ? { generation: await invoke<number>('open_connection', { record, token }), endpointIndex: 0 }
-        : await invoke<{ generation: number; endpointIndex: number }>('open_node', { record, token, requestId: openingRequest.current })
+        ? { generation: await invoke<number>('open_connection', { record, token: explicitToken }), endpointIndex: 0 }
+        : await invoke<{ generation: number; endpointIndex: number }>('open_node', { record, token: explicitToken, requestId: openingRequest.current })
       generations.current[record.id] = result.generation
       setCurrentEntries(current => ({ ...current, [record.id]: connectionEndpoints(record)[result.endpointIndex]?.label ?? '默认入口' }))
       store.markOpened(record.id)
@@ -153,8 +203,11 @@ function App() {
   }
 
   return (
-    <main className="app-shell">
-      <header className="topbar">
+    <>
+      {nativeTabsEnabled && <TabBar snapshot={tabs.snapshot} onSelect={selectTab} onManager={showManager} onClose={closeTabFromBar} onNew={showChooser} />}
+      {nativeTabsEnabled && chooserOpen && <TabChooser connections={connections} openTabIds={openTabIds} onChoose={record => { setChooserOpen(false); void openConnection(record) }} onNewNode={startNewNode} onDismiss={() => setChooserOpen(false)} />}
+      <main className={nativeTabsEnabled ? 'app-shell with-tabs' : 'app-shell'}>
+        <header className="topbar">
         <div>
           <p className="eyebrow">DSH CLIENT</p>
           <h1>连接到正在运行的 DSH</h1>
@@ -189,7 +242,7 @@ function App() {
         <section className="panel add-panel">
           <div className="panel-heading"><div><p className="section-kicker">NEW CONNECTION</p><h2>{editing ? "编辑节点" : "新建节点"}</h2></div></div>
           <form className="connection-form" onSubmit={event => void addConnection(event)}>
-            <label>显示名称<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })} placeholder="Mac mini · 本机" /></label>
+            <label>显示名称<input ref={nameInputRef} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })} placeholder="Mac mini · 本机" /></label>
             <p className="form-hint">入口从上往下依次尝试，建议 LAN → WG。已打开窗口保持当前入口；关闭重开时重新按顺序选择。</p>
             <EndpointEditor entries={entries} setEntries={setEntries} ssh={capabilities.sshForward} multiple={!capabilities.android} />
             <p className="form-hint">{capabilities.android && "Android 使用独立 WebView Profile，需要系统 WebView 支持；不支持时请更新系统 WebView。"}先保存不含 token 的地址，再在左侧连接的一次性输入框粘贴 token 并打开。SSH 使用已有密钥，首次使用前请在终端确认主机指纹。</p>
@@ -201,7 +254,8 @@ function App() {
       </section>
 
       <footer className="footer-note"><span>DSH Web UI 由目标节点提供</span><span>·</span><span>不启动、不托管执行体</span></footer>
-    </main>
+      </main>
+    </>
   )
 }
 
