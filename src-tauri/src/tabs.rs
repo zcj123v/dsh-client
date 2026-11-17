@@ -117,8 +117,39 @@ impl TabRegistry {
         }
     }
 }
-pub fn content_layout(w: f64, h: f64) -> (f64, f64, f64, f64) {
-    (0., 56., w.max(0.), (h - 56.).max(0.))
+pub fn content_layout(region: (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+    let (x, y, w, h) = region;
+    (x, y + 56., w.max(0.), (h - 56.).max(0.))
+}
+/// Wry's child coordinates cover the full-size NSView, including the titlebar.
+/// AppKit's public contentLayoutRect identifies the unobscured HTML viewport.
+/// Read it on the main thread and convert it to the parent's top-left coordinates.
+fn content_region(app: &tauri::AppHandle) -> Result<(f64, f64, f64, f64), String> {
+    let shell = app.get_webview("main").ok_or("管理页面不可用")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    shell
+        .with_webview(move |platform| {
+            let pointer = platform.ns_window().cast::<objc2_app_kit::NSWindow>();
+            let region = unsafe { pointer.as_ref() }
+                .ok_or("窗口尺寸不可用")
+                .and_then(|window| {
+                    let parent = window.contentView().ok_or("窗口内容区域不可用")?;
+                    let safe = parent.convertRect_fromView(window.contentLayoutRect(), None);
+                    // Match Wry's window_position conversion: native parent frame height,
+                    // not the outer NSWindow height or the HTML viewport's CSS origin.
+                    let top = if parent.isFlipped() {
+                        safe.origin.y
+                    } else {
+                        parent.frame().size.height - safe.origin.y - safe.size.height
+                    };
+                    Ok((safe.origin.x, top, safe.size.width, safe.size.height))
+                })
+                .map_err(str::to_owned);
+            let _ = tx.send(region);
+        })
+        .map_err(|_| "无法读取窗口内容区域")?;
+    rx.recv_timeout(Duration::from_secs(2))
+        .map_err(|_| "窗口尺寸读取超时")?
 }
 pub fn snapshot(app: &tauri::AppHandle) -> Result<TabSnapshot, String> {
     Ok(app
@@ -134,16 +165,17 @@ pub fn publish(app: &tauri::AppHandle) {
     }
 }
 pub fn layout(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_window("main") {
-        if let (Ok(size), Ok(scale)) = (window.inner_size(), window.scale_factor()) {
-            let size = size.to_logical::<f64>(scale);
-            let (x, y, w, h) = content_layout(size.width, size.height);
-            for view in window.webviews().iter().filter(|v| v.label() != "main") {
-                let _ = view.set_bounds(tauri::Rect {
-                    position: tauri::LogicalPosition::new(x, y).into(),
-                    size: tauri::LogicalSize::new(w, h).into(),
-                });
-            }
+    if let (Some(window), Ok(region)) = (app.get_window("main"), content_region(app)) {
+        let (x, y, w, h) = content_layout(region);
+        for view in window
+            .webviews()
+            .iter()
+            .filter(|v| v.label().starts_with("dsh-"))
+        {
+            let _ = view.set_bounds(tauri::Rect {
+                position: tauri::LogicalPosition::new(x, y).into(),
+                size: tauri::LogicalSize::new(w, h).into(),
+            });
         }
     }
 }
@@ -461,15 +493,11 @@ pub async fn open_connection(
                 tauri::webview::NewWindowResponse::Deny
             });
         let window = app.get_window("main").ok_or("主窗口不可用")?;
-        let size = window
-            .inner_size()
-            .map_err(|_| "窗口尺寸不可用")?
-            .to_logical::<f64>(window.scale_factor().map_err(|_| "窗口缩放不可用")?);
-        let (_, _, w, h) = content_layout(size.width, size.height);
+        let (x, y, w, h) = content_layout(content_region(app)?);
         let view = window
             .add_child(
                 builder,
-                tauri::LogicalPosition::new(0., 56.),
+                tauri::LogicalPosition::new(x, y),
                 tauri::LogicalSize::new(w, h),
             )
             .map_err(|_| "无法创建标签内容")?;
@@ -494,6 +522,8 @@ pub async fn open_connection(
             guard.commit();
         }
     }
+    // Re-read the safe region in case the window resized while the child was created.
+    layout(app);
     install_recovery_events(app, &record.id, &base);
     app.state::<Connections>()
         .tabs
@@ -653,8 +683,25 @@ mod tests {
         assert!(ensure_active(&retry).is_err());
     }
     #[test]
+    fn layout_reserves_the_tabbar_below_the_system_titlebar() {
+        // macOS visible titlebar: full-size native parent, safe HTML viewport starts 33pt down.
+        assert_eq!(
+            content_layout((0., 33., 1180., 747.)),
+            (0., 89., 1180., 691.)
+        );
+        // Fullscreen has no titlebar inset; logical coordinates are independent of backing scale.
+        assert_eq!(
+            content_layout((0., 0., 1512., 982.)),
+            (0., 56., 1512., 926.)
+        );
+        assert_eq!(content_layout((8., 28., 900., 500.)), (8., 84., 900., 444.));
+    }
+    #[test]
     fn layout_keeps_header_constant_across_retina_and_small_window() {
-        assert_eq!(content_layout(1440., 900.), (0., 56., 1440., 844.));
-        assert_eq!(content_layout(500., 40.), (0., 56., 500., 0.));
+        assert_eq!(
+            content_layout((0., 0., 1440., 900.)),
+            (0., 56., 1440., 844.)
+        );
+        assert_eq!(content_layout((0., 0., 500., 40.)), (0., 56., 500., 0.));
     }
 }

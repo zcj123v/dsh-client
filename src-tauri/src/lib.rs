@@ -990,6 +990,7 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             tabs::install(app)?;
+
             Ok(())
         })
         .build(tauri::generate_context!())
