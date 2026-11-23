@@ -979,6 +979,14 @@ pub fn run() {
     let builder = builder.plugin(android::init());
     #[cfg(not(target_os = "android"))]
     let builder = builder.manage(Connections::default());
+    #[cfg(target_os = "macos")]
+    let context = {
+        let mut context = tauri::generate_context!();
+        downloads::authorize_save_download(context.runtime_authority_mut());
+        context
+    };
+    #[cfg(not(target_os = "macos"))]
+    let context = tauri::generate_context!();
     builder
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -988,7 +996,9 @@ pub fn run() {
             open_node,
             open_connection,
             delete_connection,
-            close_connection
+            close_connection,
+            #[cfg(target_os = "macos")]
+            downloads::save_download
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -996,7 +1006,7 @@ pub fn run() {
 
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("无法启动 DSH Client")
         .run(|_app, _event| {
             #[cfg(target_os = "macos")]

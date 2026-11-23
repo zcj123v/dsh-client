@@ -459,6 +459,7 @@ pub async fn open_connection(
         let popup_session = Arc::downgrade(&session);
         let popup_label = label.clone();
         let builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(target))
+            .initialization_script(downloads::file_actions_initialization_script())
             .data_store_identifier(partition_id(&record.id))
             .disable_drag_drop_handler()
             .on_page_load(|view, payload| {

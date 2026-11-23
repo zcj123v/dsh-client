@@ -1,16 +1,17 @@
-use crate::policy::same_origin;
+use crate::{Connections, policy::same_origin, tabs::TabSession};
 use reqwest::{
     StatusCode,
     blocking::{Client, Response},
     header::{CONTENT_RANGE, COOKIE, RANGE},
     redirect::Policy,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use std::{
     ffi::CString,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Weak, atomic::Ordering},
     time::Duration,
 };
 use tauri::{AppHandle, Manager, Url, Webview};
@@ -23,7 +24,7 @@ const MAX_REDIRECTS: usize = 5;
 const RENAME_EXCL: u32 = 0x0000_0004;
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DownloadRequest {
     pub url: String,
     pub name: Option<String>,
@@ -37,11 +38,167 @@ pub enum SaveOutcome {
     Cancelled,
 }
 
+impl Serialize for SaveOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Saved(path) => {
+                let mut value = serializer.serialize_struct("SaveOutcome", 2)?;
+                value.serialize_field("status", "saved")?;
+                value.serialize_field("path", path)?;
+                value.end()
+            }
+            Self::Cancelled => {
+                let mut value = serializer.serialize_struct("SaveOutcome", 1)?;
+                value.serialize_field("status", "cancelled")?;
+                value.end()
+            }
+        }
+    }
+}
+
+struct NodeContent {
+    id: String,
+    origin: Url,
+    session: Weak<TabSession>,
+    generation: u64,
+}
+
+impl NodeContent {
+    fn is_current(&self, state: &Connections) -> Result<(), String> {
+        let session = self.session.upgrade().ok_or("节点已关闭或已替换")?;
+        if session.cancelled.load(Ordering::SeqCst)
+            || session.generation.load(Ordering::SeqCst) != self.generation
+        {
+            return Err("节点已关闭或已替换".into());
+        }
+        let registered = state
+            .tabs
+            .lock()
+            .map_err(|_| "标签状态不可用")?
+            .get(&self.id)
+            .is_some_and(|current| Arc::ptr_eq(&current, &session));
+        if !registered {
+            return Err("节点已关闭或已替换".into());
+        }
+        let origin = state
+            .urls
+            .lock()
+            .map_err(|_| "连接状态不可用")?
+            .get(&self.id)
+            .cloned()
+            .ok_or("未知节点或连接已关闭")?;
+        if origin != self.origin {
+            return Err("节点入口已变化，请重试".into());
+        }
+        Ok(())
+    }
+}
+
+fn require_node_content_state(
+    state: &Connections,
+    webview_label: &str,
+    window_label: &str,
+    current: &Url,
+) -> Result<NodeContent, String> {
+    if window_label != "main" && window_label != webview_label {
+        return Err("仅已登记节点内容页可下载文件".into());
+    }
+    let id = webview_label
+        .strip_prefix("dsh-")
+        .ok_or("仅已登记节点内容页可下载文件")?;
+    crate::policy::connection_id(id)?;
+    let session = state
+        .tabs
+        .lock()
+        .map_err(|_| "标签状态不可用")?
+        .get(id)
+        .ok_or("未知节点或连接已关闭")?;
+    if session.cancelled.load(Ordering::SeqCst) {
+        return Err("节点已关闭或已替换".into());
+    }
+    let origin = state
+        .urls
+        .lock()
+        .map_err(|_| "连接状态不可用")?
+        .get(id)
+        .cloned()
+        .ok_or("未知节点或连接已关闭")?;
+    if !same_origin(&origin, current) {
+        return Err("节点页面来源已变化，请重试".into());
+    }
+    Ok(NodeContent {
+        id: id.into(),
+        origin,
+        generation: session.generation.load(Ordering::SeqCst),
+        session: Arc::downgrade(&session),
+    })
+}
+
+fn require_node_content(app: &AppHandle, webview: &Webview) -> Result<NodeContent, String> {
+    let current = webview.url().map_err(|_| "无法验证节点页面来源")?;
+    require_node_content_state(
+        &app.state::<Connections>(),
+        webview.label(),
+        webview.window().label(),
+        &current,
+    )
+}
+
+pub fn authorize_save_download(authority: &mut tauri::ipc::RuntimeAuthority) {
+    // Node origins are runtime data, so transport ACL accepts remote origins;
+    // save_download independently restricts the caller to a registered node
+    // content WebView and the exact registered origin before doing any I/O.
+    authority.__allow_command(
+        "save_download".into(),
+        tauri::utils::acl::ExecutionContext::Remote {
+            url: "http{s}?://*:*/*".parse().expect("HTTP(S) remote URL pattern"),
+        },
+    );
+}
+
+pub fn file_actions_initialization_script() -> String {
+    let source = include_str!("../../src/file-actions.ts")
+        .replace("export function installFileActionsBridge", "function installFileActionsBridge");
+    format!("(() => {{\n{source}\ninstallFileActionsBridge(window);\n}})();")
+}
+
+#[tauri::command]
+pub async fn save_download(
+    webview: Webview,
+    app: AppHandle,
+    request: DownloadRequest,
+) -> Result<SaveOutcome, String> {
+    let owner = require_node_content(&app, &webview)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        save_guarded(&app, &webview, request, || {
+            owner.is_current(&app.state::<Connections>())
+        })
+    })
+    .await
+    .map_err(|_| "下载任务未完成")?
+}
+
 pub fn save(
     app: &AppHandle,
     webview: &Webview,
     request: DownloadRequest,
 ) -> Result<SaveOutcome, String> {
+    save_guarded(app, webview, request, || Ok(()))
+}
+
+fn save_guarded<F>(
+    app: &AppHandle,
+    webview: &Webview,
+    request: DownloadRequest,
+    ensure_current: F,
+) -> Result<SaveOutcome, String>
+where
+    F: Fn() -> Result<(), String>,
+{
+    ensure_current()?;
     let id = webview
         .label()
         .strip_prefix("dsh-")
@@ -97,7 +254,14 @@ pub fn save(
                 .join("; "),
         )
     };
-    download_to_path(&source, &origin, cookie.as_deref(), &destination, overwrite)?;
+    download_to_path_guarded(
+        &source,
+        &origin,
+        cookie.as_deref(),
+        &destination,
+        overwrite,
+        &ensure_current,
+    )?;
     Ok(SaveOutcome::Saved(destination))
 }
 
@@ -225,16 +389,36 @@ fn download_to_path(
     destination: &Path,
     overwrite: bool,
 ) -> Result<(), String> {
+    download_to_path_guarded(source, origin, cookie, destination, overwrite, &|| Ok(()))
+}
+
+fn download_to_path_guarded(
+    source: &Url,
+    origin: &Url,
+    cookie: Option<&str>,
+    destination: &Path,
+    overwrite: bool,
+    ensure_current: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    ensure_current()?;
     let source = validate_source(source.as_str(), Some(origin))?;
     let directory = destination.parent().ok_or("下载目标目录无效")?;
     let mut temporary = NamedTempFile::with_prefix_in(".dsh-download-", directory)
         .map_err(|_| "无法在下载目录创建临时文件")?;
-    let result = stream_download(&source, origin, cookie, temporary.as_file_mut());
+    let result = stream_download(
+        &source,
+        origin,
+        cookie,
+        temporary.as_file_mut(),
+        ensure_current,
+    );
     if result.is_ok() {
         temporary
             .as_file_mut()
             .sync_all()
             .map_err(|_| "无法同步下载临时文件")?;
+        // The final owner/generation check happens before the only visible write.
+        ensure_current()?;
         atomic_rename(temporary.path(), destination, overwrite)?;
     }
     result
@@ -245,6 +429,7 @@ fn stream_download(
     origin: &Url,
     cookie: Option<&str>,
     output: &mut fs::File,
+    ensure_current: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
     let redirect_origin = origin.clone();
     let client = Client::builder()
@@ -266,6 +451,7 @@ fn stream_download(
     let mut offset = 0_u64;
     let mut expected_total = None;
     loop {
+        ensure_current()?;
         let block_end = offset.checked_add(CHUNK_SIZE - 1).ok_or("下载文件过大")?;
         let requested_end = expected_total.map_or(block_end, |total: u64| block_end.min(total - 1));
         let mut request = client
@@ -277,7 +463,7 @@ fn stream_download(
         let response = request.send().map_err(|_| "下载请求失败")?;
         match response.status() {
             StatusCode::OK if offset == 0 => {
-                copy_bounded(response, output, None)?;
+                copy_bounded(response, output, None, ensure_current)?;
                 return Ok(());
             }
             StatusCode::PARTIAL_CONTENT => {
@@ -293,7 +479,12 @@ fn stream_download(
                     return Err("下载文件总长度在分块间变化".into());
                 }
                 expected_total = Some(total);
-                copy_bounded(response, output, Some(actual_end - offset + 1))?;
+                copy_bounded(
+                    response,
+                    output,
+                    Some(actual_end - offset + 1),
+                    ensure_current,
+                )?;
                 if actual_end + 1 == total {
                     return Ok(());
                 }
@@ -330,10 +521,12 @@ fn copy_bounded(
     mut response: Response,
     output: &mut fs::File,
     expected_length: Option<u64>,
+    ensure_current: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
     let mut buffer = [0_u8; READ_BUFFER_SIZE];
     let mut written = 0_u64;
     loop {
+        ensure_current()?;
         let count = response
             .read(&mut buffer)
             .map_err(|error| format!("下载读取失败：{error}"))?;
@@ -578,6 +771,168 @@ mod tests {
     fn assert_failure_left_no_files(directory: &Path) {
         let entries = fs::read_dir(directory).unwrap();
         assert_eq!(entries.count(), 0, "failed download left files behind");
+    }
+
+    const NODE_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
+
+    fn node_state() -> (Connections, Arc<crate::tabs::TabSession>, Url) {
+        let state = Connections::default();
+        let origin = Url::parse("https://node.example:8443/").unwrap();
+        let session = state
+            .tabs
+            .lock()
+            .unwrap()
+            .begin(NODE_ID, "Node", 7);
+        state
+            .urls
+            .lock()
+            .unwrap()
+            .insert(NODE_ID.into(), origin.clone());
+        (state, session, origin)
+    }
+
+    #[test]
+    fn remote_node_content_can_invoke_only_the_download_command() {
+        let mut authority = tauri::runtime_authority!(
+            std::collections::BTreeMap::new(),
+            tauri::utils::acl::resolved::Resolved::default()
+        );
+        authorize_save_download(&mut authority);
+        let label = format!("dsh-{NODE_ID}");
+        for url in [
+            "https://node.example:8443/files",
+            "http://127.0.0.1:41234/files",
+        ] {
+            let origin = tauri::ipc::Origin::Remote {
+                url: Url::parse(url).unwrap(),
+            };
+            assert!(
+                authority
+                    .resolve_access("save_download", "main", &label, &origin)
+                    .is_some(),
+                "the real remote content WebView must pass the IPC ACL"
+            );
+            assert!(
+                authority
+                    .resolve_access("open_node", "main", &label, &origin)
+                    .is_none(),
+                "remote node content must not gain shell commands"
+            );
+        }
+    }
+
+    #[test]
+    fn node_content_identity_requires_a_registered_exact_node_label() {
+        let (state, _session, origin) = node_state();
+        let label = format!("dsh-{NODE_ID}");
+        assert!(
+            require_node_content_state(&state, &label, "main", &origin).is_ok(),
+            "macOS child content WebView must be accepted"
+        );
+        assert!(
+            require_node_content_state(&state, &label, &label, &origin).is_ok(),
+            "an independently owned node window must be accepted"
+        );
+        for (webview, window) in [
+            ("main", "main"),
+            (&format!("clear-{NODE_ID}"), "main"),
+            (&label, "other"),
+            ("dsh-not-a-uuid", "main"),
+            ("dsh-123e4567-e89b-42d3-a456-426614174001", "main"),
+        ] {
+            assert!(
+                require_node_content_state(&state, webview, window, &origin).is_err(),
+                "accepted unregistered identity {webview}/{window}"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_replaced_or_new_generation_owner_invalidates_pending_save() {
+        let (state, session, origin) = node_state();
+        let label = format!("dsh-{NODE_ID}");
+        let owner = require_node_content_state(&state, &label, "main", &origin).unwrap();
+        assert!(owner.is_current(&state).is_ok());
+
+        state
+            .tabs
+            .lock()
+            .unwrap()
+            .mark_failed(&session, 7);
+        state.tabs.lock().unwrap().begin(NODE_ID, "Node", 8);
+        assert!(
+            owner.is_current(&state).is_err(),
+            "a previous connection generation must not finish a save"
+        );
+
+        let (state, session, origin) = node_state();
+        let owner = require_node_content_state(&state, &label, "main", &origin).unwrap();
+        state.tabs.lock().unwrap().close(NODE_ID);
+        assert!(
+            owner.is_current(&state).is_err(),
+            "closing a node must cancel its save"
+        );
+
+        // Even a reused numeric generation cannot make a different owner current.
+        state.tabs.lock().unwrap().begin(NODE_ID, "Node", 7);
+        assert!(!Arc::ptr_eq(
+            &session,
+            &state.tabs.lock().unwrap().get(NODE_ID).unwrap()
+        ));
+        assert!(owner.is_current(&state).is_err());
+    }
+
+    #[test]
+    fn native_request_rejects_extra_path_and_credential_fields() {
+        for field in ["path", "token", "cookie"] {
+            let value = serde_json::json!({
+                "url": "https://node.example:8443/file",
+                "mode": "download",
+                field: "must-not-cross-ipc"
+            });
+            assert!(serde_json::from_value::<DownloadRequest>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn save_outcome_serializes_the_web_contract() {
+        assert_eq!(
+            serde_json::to_value(SaveOutcome::Saved(PathBuf::from(
+                "/Users/test/Downloads/a.apk"
+            )))
+            .unwrap(),
+            serde_json::json!({"status":"saved","path":"/Users/test/Downloads/a.apk"})
+        );
+        assert_eq!(
+            serde_json::to_value(SaveOutcome::Cancelled).unwrap(),
+            serde_json::json!({"status":"cancelled"})
+        );
+    }
+
+    #[test]
+    fn owner_loss_at_final_check_cleans_temp_without_committing_destination() {
+        let server = TestServer::start(|_| FixtureResponse::new(200, b"complete".to_vec()));
+        let directory = TempDir::new().unwrap();
+        let destination = directory.path().join("stale.apk");
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let result = download_to_path_guarded(
+            &server.url(),
+            &server.origin,
+            None,
+            &destination,
+            false,
+            &|| {
+                // 200 response: pre-temp, request, two bounded reads, then final commit.
+                if checks.fetch_add(1, Ordering::SeqCst) == 4 {
+                    Err("节点已关闭或已替换".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert!(!destination.exists());
+        assert_failure_left_no_files(directory.path());
     }
 
     #[test]
