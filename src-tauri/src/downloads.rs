@@ -120,8 +120,35 @@ fn validate_source(raw: &str, registered_origin: Option<&Url>) -> Result<Url, St
         return Err("下载 URL 必须与当前节点同源".into());
     }
     if source.query_pairs().any(|(key, _)| {
-        ["token", "password", "secret", "authorization"]
-            .contains(&key.to_ascii_lowercase().as_str())
+        let normalized = key
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .map(|character| character.to_ascii_lowercase())
+            .collect::<String>();
+        [
+            "token",
+            "accesstoken",
+            "refreshtoken",
+            "idtoken",
+            "authtoken",
+            "password",
+            "passwd",
+            "pwd",
+            "secret",
+            "clientsecret",
+            "authorization",
+            "auth",
+            "apikey",
+            "credential",
+            "credentials",
+            "session",
+            "sessionid",
+            "cookie",
+            "signature",
+            "sig",
+            "privatekey",
+        ]
+        .contains(&normalized.as_str())
     }) {
         return Err("下载 URL 不得携带凭据".into());
     }
@@ -240,10 +267,10 @@ fn stream_download(
     let mut expected_total = None;
     loop {
         let block_end = offset.checked_add(CHUNK_SIZE - 1).ok_or("下载文件过大")?;
-        let end = expected_total.map_or(block_end, |total: u64| block_end.min(total - 1));
+        let requested_end = expected_total.map_or(block_end, |total: u64| block_end.min(total - 1));
         let mut request = client
             .get(source.clone())
-            .header(RANGE, format!("bytes={offset}-{end}"));
+            .header(RANGE, format!("bytes={offset}-{requested_end}"));
         if let Some(cookie) = cookie {
             request = request.header(COOKIE, cookie);
         }
@@ -260,23 +287,28 @@ fn stream_download(
                     .ok_or("206 响应缺少 Content-Range")?
                     .to_str()
                     .map_err(|_| "Content-Range 无效")?;
-                let total = parse_content_range(content_range, offset, end)?;
+                let (actual_end, total) =
+                    parse_content_range(content_range, offset, requested_end)?;
                 if expected_total.is_some_and(|expected| expected != total) {
                     return Err("下载文件总长度在分块间变化".into());
                 }
                 expected_total = Some(total);
-                copy_bounded(response, output, Some(end - offset + 1))?;
-                if end + 1 == total {
+                copy_bounded(response, output, Some(actual_end - offset + 1))?;
+                if actual_end + 1 == total {
                     return Ok(());
                 }
-                offset = end + 1;
+                offset = actual_end + 1;
             }
             _ => return Err("下载服务返回了不符合请求范围的响应".into()),
         }
     }
 }
 
-fn parse_content_range(value: &str, expected_start: u64, expected_end: u64) -> Result<u64, String> {
+fn parse_content_range(
+    value: &str,
+    expected_start: u64,
+    requested_end: u64,
+) -> Result<(u64, u64), String> {
     let range = value
         .strip_prefix("bytes ")
         .ok_or("Content-Range 单位无效")?;
@@ -285,13 +317,13 @@ fn parse_content_range(value: &str, expected_start: u64, expected_end: u64) -> R
     let start = start.parse::<u64>().map_err(|_| "Content-Range 起点无效")?;
     let end = end.parse::<u64>().map_err(|_| "Content-Range 终点无效")?;
     let total = total.parse::<u64>().map_err(|_| "Content-Range 总长无效")?;
-    if start != expected_start || end != expected_end || end < start {
+    if start != expected_start || end < start || end > requested_end {
         return Err("Content-Range 与请求范围不一致".into());
     }
     if total <= end {
         return Err("Content-Range 总长无效".into());
     }
-    Ok(total)
+    Ok((end, total))
 }
 
 fn copy_bounded(
@@ -573,6 +605,44 @@ mod tests {
     }
 
     #[test]
+    fn validate_source_rejects_normalized_common_credential_query_names() {
+        let origin = Url::parse("https://node.example:8443/").unwrap();
+        for key in [
+            "access_token",
+            "ACCESS-TOKEN",
+            "Access.Token",
+            "api_key",
+            "API-KEY",
+            "Api.Key",
+            "auth",
+            "AUTH",
+            "client_secret",
+            "refresh_token",
+            "id_token",
+            "auth_token",
+            "credential",
+            "session_id",
+            "cookie",
+            "signature",
+            "private_key",
+            "access%5Ftoken",
+        ] {
+            let url = format!("https://node.example:8443/file?{key}=synthetic");
+            assert!(
+                validate_source(&url, Some(&origin)).is_err(),
+                "accepted {key}"
+            );
+        }
+        assert!(
+            validate_source(
+                "https://node.example:8443/file?name=a.apk&download=1",
+                Some(&origin)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn safe_file_name_removes_paths_controls_and_special_names() {
         assert_eq!(safe_file_name("a.apk"), "a.apk");
         assert_eq!(safe_file_name(".apk"), ".apk");
@@ -635,6 +705,69 @@ mod tests {
         assert!(requests.iter().all(|request| {
             request.headers.get("cookie").map(String::as_str) == Some(TEST_COOKIE)
         }));
+    }
+
+    #[test]
+    fn small_legal_206_response_uses_total_bounded_end_and_finishes() {
+        let server = TestServer::start(|request| {
+            assert_eq!(request.range(), Some((0, 1_048_575)));
+            FixtureResponse::new(206, synthetic_bytes(0, 1000))
+                .header("Content-Range", "bytes 0-999/1000".into())
+        });
+        let directory = TempDir::new().unwrap();
+        let saved = download(
+            &server.url(),
+            &server.origin,
+            None,
+            directory.path(),
+            "small.apk",
+        )
+        .unwrap();
+        assert_eq!(fs::read(saved).unwrap(), synthetic_bytes(0, 1000));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn shorter_than_requested_ranges_advance_by_actual_end() {
+        let length = 2500;
+        let server = TestServer::start(move |request| {
+            let (start, _) = request.range().unwrap();
+            let actual_end = (start + 99).min(length - 1);
+            FixtureResponse::new(
+                206,
+                synthetic_bytes(start, (actual_end - start + 1) as usize),
+            )
+            .header(
+                "Content-Range",
+                format!("bytes {start}-{actual_end}/{length}"),
+            )
+        });
+        let directory = TempDir::new().unwrap();
+        let saved = download(
+            &server.url(),
+            &server.origin,
+            None,
+            directory.path(),
+            "short-ranges.apk",
+        )
+        .unwrap();
+        assert_eq!(hash_file(&saved), synthetic_hash(length));
+        let requests = server.requests();
+        let expected: Vec<_> = (0..length)
+            .step_by(100)
+            .map(|start| {
+                let requested_end = if start == 0 { 1_048_575 } else { length - 1 };
+                Some((start, requested_end))
+            })
+            .collect();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.range())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(requests.len(), 25);
     }
 
     #[test]
