@@ -33,7 +33,7 @@ export function installFileActionsBridge(root) {
       } catch {
         throw new Error('Invalid file URL')
       }
-      if (!['http:', 'https:'].includes(source.protocol) || source.username || source.password) {
+      if (!['http:', 'https:'].includes(source.protocol) || source.username || source.password || value.url.includes('#')) {
         throw new Error('Unsupported file URL')
       }
       if (value.mode !== 'download' && value.mode !== 'saveAs') throw new Error('Invalid save mode')

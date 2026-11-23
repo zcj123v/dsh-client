@@ -67,20 +67,21 @@ struct NodeContent {
 }
 
 impl NodeContent {
-    fn is_current(&self, state: &Connections) -> Result<(), String> {
+    fn with_current(
+        &self,
+        state: &Connections,
+        action: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
         let session = self.session.upgrade().ok_or("节点已关闭或已替换")?;
+        // Keep this registry lock through action. tabs::close uses the same lock
+        // before cancellation/removal, so close linearizes before or after commit.
+        let tabs = state.tabs.lock().map_err(|_| "标签状态不可用")?;
         if session.cancelled.load(Ordering::SeqCst)
             || session.generation.load(Ordering::SeqCst) != self.generation
+            || !tabs
+                .get(&self.id)
+                .is_some_and(|current| Arc::ptr_eq(&current, &session))
         {
-            return Err("节点已关闭或已替换".into());
-        }
-        let registered = state
-            .tabs
-            .lock()
-            .map_err(|_| "标签状态不可用")?
-            .get(&self.id)
-            .is_some_and(|current| Arc::ptr_eq(&current, &session));
-        if !registered {
             return Err("节点已关闭或已替换".into());
         }
         let origin = state
@@ -93,7 +94,11 @@ impl NodeContent {
         if origin != self.origin {
             return Err("节点入口已变化，请重试".into());
         }
-        Ok(())
+        action()
+    }
+
+    fn is_current(&self, state: &Connections) -> Result<(), String> {
+        self.with_current(state, &mut || Ok(()))
     }
 }
 
@@ -173,8 +178,8 @@ pub async fn save_download(
 ) -> Result<SaveOutcome, String> {
     let owner = require_node_content(&app, &webview)?;
     tauri::async_runtime::spawn_blocking(move || {
-        save_guarded(&app, &webview, request, || {
-            owner.is_current(&app.state::<Connections>())
+        save_guarded(&app, &webview, request, |action| {
+            owner.with_current(&app.state::<Connections>(), action)
         })
     })
     .await
@@ -186,19 +191,19 @@ pub fn save(
     webview: &Webview,
     request: DownloadRequest,
 ) -> Result<SaveOutcome, String> {
-    save_guarded(app, webview, request, || Ok(()))
+    save_guarded(app, webview, request, |action| action())
 }
 
 fn save_guarded<F>(
     app: &AppHandle,
     webview: &Webview,
     request: DownloadRequest,
-    ensure_current: F,
+    with_current: F,
 ) -> Result<SaveOutcome, String>
 where
-    F: Fn() -> Result<(), String>,
+    F: Fn(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
 {
-    ensure_current()?;
+    with_current(&mut || Ok(()))?;
     let id = webview
         .label()
         .strip_prefix("dsh-")
@@ -260,7 +265,7 @@ where
         cookie.as_deref(),
         &destination,
         overwrite,
-        &ensure_current,
+        &with_current,
     )?;
     Ok(SaveOutcome::Saved(destination))
 }
@@ -268,6 +273,9 @@ where
 fn validate_source(raw: &str, registered_origin: Option<&Url>) -> Result<Url, String> {
     let origin = registered_origin.ok_or("未知节点或连接已关闭")?;
     let source = Url::parse(raw).map_err(|_| "下载 URL 无效")?;
+    if source.fragment().is_some() {
+        return Err("下载 URL 不得包含 fragment".into());
+    }
     for url in [origin, &source] {
         let loopback =
             [Some("127.0.0.1"), Some("localhost"), Some("[::1]")].contains(&url.host_str());
@@ -389,7 +397,7 @@ fn download_to_path(
     destination: &Path,
     overwrite: bool,
 ) -> Result<(), String> {
-    download_to_path_guarded(source, origin, cookie, destination, overwrite, &|| Ok(()))
+    download_to_path_guarded(source, origin, cookie, destination, overwrite, &|action| action())
 }
 
 fn download_to_path_guarded(
@@ -398,9 +406,9 @@ fn download_to_path_guarded(
     cookie: Option<&str>,
     destination: &Path,
     overwrite: bool,
-    ensure_current: &dyn Fn() -> Result<(), String>,
+    with_current: &dyn Fn(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
 ) -> Result<(), String> {
-    ensure_current()?;
+    with_current(&mut || Ok(()))?;
     let source = validate_source(source.as_str(), Some(origin))?;
     let directory = destination.parent().ok_or("下载目标目录无效")?;
     let mut temporary = NamedTempFile::with_prefix_in(".dsh-download-", directory)
@@ -410,16 +418,15 @@ fn download_to_path_guarded(
         origin,
         cookie,
         temporary.as_file_mut(),
-        ensure_current,
+        with_current,
     );
     if result.is_ok() {
         temporary
             .as_file_mut()
             .sync_all()
             .map_err(|_| "无法同步下载临时文件")?;
-        // The final owner/generation check happens before the only visible write.
-        ensure_current()?;
-        atomic_rename(temporary.path(), destination, overwrite)?;
+        // Owner validation and the visible write share one registry critical section.
+        with_current(&mut || atomic_rename(temporary.path(), destination, overwrite))?;
     }
     result
 }
@@ -429,7 +436,7 @@ fn stream_download(
     origin: &Url,
     cookie: Option<&str>,
     output: &mut fs::File,
-    ensure_current: &dyn Fn() -> Result<(), String>,
+    with_current: &dyn Fn(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
 ) -> Result<(), String> {
     let redirect_origin = origin.clone();
     let client = Client::builder()
@@ -451,7 +458,7 @@ fn stream_download(
     let mut offset = 0_u64;
     let mut expected_total = None;
     loop {
-        ensure_current()?;
+        with_current(&mut || Ok(()))?;
         let block_end = offset.checked_add(CHUNK_SIZE - 1).ok_or("下载文件过大")?;
         let requested_end = expected_total.map_or(block_end, |total: u64| block_end.min(total - 1));
         let mut request = client
@@ -463,7 +470,7 @@ fn stream_download(
         let response = request.send().map_err(|_| "下载请求失败")?;
         match response.status() {
             StatusCode::OK if offset == 0 => {
-                copy_bounded(response, output, None, ensure_current)?;
+                copy_bounded(response, output, None, with_current)?;
                 return Ok(());
             }
             StatusCode::PARTIAL_CONTENT => {
@@ -483,7 +490,7 @@ fn stream_download(
                     response,
                     output,
                     Some(actual_end - offset + 1),
-                    ensure_current,
+                    with_current,
                 )?;
                 if actual_end + 1 == total {
                     return Ok(());
@@ -521,12 +528,12 @@ fn copy_bounded(
     mut response: Response,
     output: &mut fs::File,
     expected_length: Option<u64>,
-    ensure_current: &dyn Fn() -> Result<(), String>,
+    with_current: &dyn Fn(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut buffer = [0_u8; READ_BUFFER_SIZE];
     let mut written = 0_u64;
     loop {
-        ensure_current()?;
+        with_current(&mut || Ok(()))?;
         let count = response
             .read(&mut buffer)
             .map_err(|error| format!("下载读取失败：{error}"))?;
@@ -910,6 +917,42 @@ mod tests {
     }
 
     #[test]
+    fn final_commit_holds_registry_lock_while_close_waits_on_the_barrier() {
+        let (state, session, origin) = node_state();
+        let state = Arc::new(state);
+        let label = format!("dsh-{NODE_ID}");
+        let owner = require_node_content_state(&state, &label, "main", &origin).unwrap();
+        let directory = TempDir::new().unwrap();
+        let mut temporary = NamedTempFile::new_in(directory.path()).unwrap();
+        temporary.write_all(b"new").unwrap();
+        let destination = directory.path().join("save-as.apk");
+        fs::write(&destination, b"old").unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let close_state = state.clone();
+        let close_barrier = barrier.clone();
+        let closer = thread::spawn(move || {
+            close_barrier.wait();
+            close_state.tabs.lock().unwrap().close(NODE_ID);
+        });
+
+        owner
+            .with_current(&state, &mut || {
+                // The closer is released only while the commit critical section runs.
+                barrier.wait();
+                assert!(
+                    state.tabs.try_lock().is_err(),
+                    "with_current released the registry lock before atomic rename"
+                );
+                assert!(!session.cancelled.load(Ordering::SeqCst));
+                atomic_rename(temporary.path(), &destination, true)
+            })
+            .unwrap();
+        closer.join().unwrap();
+        assert!(session.cancelled.load(Ordering::SeqCst));
+        assert_eq!(fs::read(destination).unwrap(), b"new");
+    }
+
+    #[test]
     fn owner_loss_at_final_check_cleans_temp_without_committing_destination() {
         let server = TestServer::start(|_| FixtureResponse::new(200, b"complete".to_vec()));
         let directory = TempDir::new().unwrap();
@@ -921,18 +964,27 @@ mod tests {
             None,
             &destination,
             false,
-            &|| {
+            &|action| {
                 // 200 response: pre-temp, request, two bounded reads, then final commit.
                 if checks.fetch_add(1, Ordering::SeqCst) == 4 {
                     Err("节点已关闭或已替换".into())
                 } else {
-                    Ok(())
+                    action()
                 }
             },
         );
         assert!(result.is_err());
         assert!(!destination.exists());
         assert_failure_left_no_files(directory.path());
+    }
+
+    #[test]
+    fn validate_source_rejects_all_fragments_including_credential_lookalikes() {
+        let origin = Url::parse("https://node.example:8443/").unwrap();
+        for suffix in ["#access_token=FRAGMENT_SENTINEL", "#"] {
+            let url = format!("https://node.example:8443/file{suffix}");
+            assert!(validate_source(&url, Some(&origin)).is_err());
+        }
     }
 
     #[test]

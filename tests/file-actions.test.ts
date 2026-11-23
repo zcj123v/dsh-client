@@ -52,6 +52,8 @@ describe('installFileActionsBridge', () => {
     [{ url: '/api/file', mode: 'download' }, 'relative URL'],
     [{ url: 'file:///tmp/artifact.apk', mode: 'download' }, 'file URL'],
     [{ url: 'blob:https://node.example/id', mode: 'download' }, 'blob URL'],
+    [{ url: `${url}#access_token=FRAGMENT_SENTINEL`, mode: 'download' }, 'fragment credentials'],
+    [{ url: `${url}#`, mode: 'download' }, 'empty fragment'],
     [{ url, mode: 'delete' }, 'unknown mode'],
     [{ url, mode: 'download', name: 42 }, 'non-string name'],
     [{ url, mode: 'download', mediaType: 42 }, 'non-string media type'],
