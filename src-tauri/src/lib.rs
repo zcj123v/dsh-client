@@ -1,6 +1,9 @@
 #[cfg(target_os = "android")]
 mod android;
 #[cfg(not(target_os = "android"))]
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+mod downloads;
 mod endpoints;
 mod policy;
 #[cfg(not(target_os = "android"))]
