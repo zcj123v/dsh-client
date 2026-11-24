@@ -10,11 +10,12 @@ use std::{
     ffi::CString,
     fs,
     io::{Read, Write},
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, Weak, atomic::Ordering},
     time::Duration,
 };
-use tauri::{AppHandle, Manager, Url, Webview};
+use tauri::{AppHandle, Manager, Url, Webview, webview::Cookie};
 use tauri_plugin_dialog::DialogExt;
 use tempfile::NamedTempFile;
 
@@ -383,10 +384,11 @@ where
     };
     let cookies = noted(
         webview
-            .cookies_for_url(source.clone())
+            .cookies()
             .map_err(|_| "无法读取节点会话 Cookie".into()),
         "cookie-error",
     )?;
+    let cookies = filter_cookies_for_source(cookies, &source);
     diagnostic(if cookies.is_empty() {
         "cookie-empty"
     } else {
@@ -413,6 +415,83 @@ where
         &with_current,
     )?;
     Ok(SaveOutcome::Saved(destination))
+}
+
+fn filter_cookies_for_source(cookies: Vec<Cookie<'static>>, source: &Url) -> Vec<Cookie<'static>> {
+    cookies
+        .into_iter()
+        .filter(|cookie| {
+            cookie_domain_matches(cookie, source)
+                && cookie_secure_matches(cookie, source)
+                && cookie_path_matches(cookie, source)
+        })
+        .collect()
+}
+
+fn normalized_source_host(source: &Url) -> Option<String> {
+    let host = source
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+fn cookie_domain_matches(cookie: &Cookie<'_>, source: &Url) -> bool {
+    let Some(mut source_host) = normalized_source_host(source) else {
+        return false;
+    };
+    // A missing Domain cannot be tied back to its host after reading the whole store.
+    let Some(raw_domain) = cookie.domain() else {
+        return false;
+    };
+    if raw_domain.is_empty() || raw_domain.starts_with('.') {
+        return false;
+    }
+    let domain = raw_domain.trim_end_matches('.').to_ascii_lowercase();
+    source_host = source_host.trim_end_matches('.').to_ascii_lowercase();
+    if let Ok(source_ip) = source_host.parse::<IpAddr>() {
+        return domain
+            .parse::<IpAddr>()
+            .is_ok_and(|cookie_ip| cookie_ip == source_ip);
+    }
+    if domain.parse::<IpAddr>().is_ok() {
+        return false;
+    }
+    // The Cookie API strips a leading Domain dot, so subdomain scope cannot be
+    // distinguished safely from host-only scope. Fail closed to an exact host.
+    source_host == domain
+}
+
+fn cookie_secure_matches(cookie: &Cookie<'_>, source: &Url) -> bool {
+    if !cookie.secure().unwrap_or(false) || source.scheme() == "https" {
+        return true;
+    }
+    if source.scheme() != "http" {
+        return false;
+    }
+    normalized_source_host(source).is_some_and(|host| {
+        host == "localhost"
+            || host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
+}
+
+fn cookie_path_matches(cookie: &Cookie<'_>, source: &Url) -> bool {
+    let request_path = source.path();
+    let cookie_path = cookie.path().unwrap_or("/");
+    if cookie_path == "/" {
+        return true;
+    }
+    if !cookie_path.starts_with('/') {
+        return false;
+    }
+    request_path == cookie_path
+        || request_path
+            .strip_prefix(cookie_path)
+            .is_some_and(|remainder| cookie_path.ends_with('/') || remainder.starts_with('/'))
 }
 
 fn validate_source(raw: &str, registered_origin: Option<&Url>) -> Result<Url, String> {
@@ -1234,6 +1313,133 @@ mod tests {
             let url = format!("https://node.example:8443/file{suffix}");
             assert!(validate_source(&url, Some(&origin)).is_err());
         }
+    }
+
+    fn fixture_cookie(
+        name: &'static str,
+        domain: Option<&'static str>,
+        path: Option<&'static str>,
+        secure: bool,
+    ) -> tauri::webview::Cookie<'static> {
+        let mut builder = tauri::webview::Cookie::build((name, "synthetic")).secure(secure);
+        if let Some(domain) = domain {
+            builder = builder.domain(domain);
+        }
+        if let Some(path) = path {
+            builder = builder.path(path);
+        }
+        builder.build()
+    }
+
+    fn filtered_cookie_names(
+        cookies: Vec<tauri::webview::Cookie<'static>>,
+        source: &str,
+    ) -> Vec<String> {
+        filter_cookies_for_source(cookies, &Url::parse(source).unwrap())
+            .into_iter()
+            .map(|cookie| cookie.name().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn cookie_filter_accepts_exact_loopback_ip_and_localhost_only() {
+        let cookies = vec![
+            fixture_cookie("ip", Some("127.0.0.1"), Some("/"), false),
+            fixture_cookie("other-ip", Some("127.0.0.2"), Some("/"), false),
+            fixture_cookie("localhost", Some("localhost"), Some("/"), false),
+            fixture_cookie("deceptive", Some("127.0.0.1.example.com"), Some("/"), false),
+            fixture_cookie("host-only", None, Some("/"), false),
+        ];
+        assert_eq!(
+            filtered_cookie_names(cookies.clone(), "http://127.0.0.1:3080/files/a.apk"),
+            ["ip"]
+        );
+        assert_eq!(
+            filtered_cookie_names(cookies, "http://localhost:3080/files/a.apk"),
+            ["localhost"]
+        );
+    }
+
+    #[test]
+    fn cookie_filter_does_not_suffix_match_unrelated_domains() {
+        let cookies = vec![
+            fixture_cookie("exact-node", Some("node.example.com"), Some("/"), false),
+            fixture_cookie("exact-parent", Some("example.com"), Some("/"), false),
+            fixture_cookie("dotted-parent", Some(".example.com"), Some("/"), false),
+            fixture_cookie("unrelated", Some("example.com.evil"), Some("/"), false),
+            fixture_cookie("dotted-other", Some(".other.example"), Some("/"), false),
+            fixture_cookie("public-suffix", Some(".com"), Some("/"), false),
+            fixture_cookie("dotted-localhost", Some(".localhost"), Some("/"), false),
+            fixture_cookie("host-only", None, Some("/"), false),
+        ];
+        assert_eq!(
+            filtered_cookie_names(cookies.clone(), "https://node.example.com/files/a.apk"),
+            ["exact-node"]
+        );
+        assert_eq!(
+            filtered_cookie_names(cookies.clone(), "https://example.com/files/a.apk"),
+            ["exact-parent", "dotted-parent"]
+        );
+        assert!(
+            filtered_cookie_names(cookies.clone(), "https://badexample.com/files/a.apk").is_empty()
+        );
+        assert!(filtered_cookie_names(cookies, "http://sub.localhost/files/a.apk").is_empty());
+    }
+
+    #[test]
+    fn cookie_filter_enforces_secure_and_preserves_loopback_exception() {
+        let cookies = vec![
+            fixture_cookie("secure", Some("node.example.com"), Some("/"), true),
+            fixture_cookie("plain", Some("node.example.com"), Some("/"), false),
+            fixture_cookie("secure-ip", Some("127.0.0.1"), Some("/"), true),
+            fixture_cookie("secure-local", Some("localhost"), Some("/"), true),
+        ];
+        assert_eq!(
+            filtered_cookie_names(cookies.clone(), "https://node.example.com/files/a.apk"),
+            ["secure", "plain"]
+        );
+        assert_eq!(
+            filtered_cookie_names(cookies.clone(), "http://node.example.com/files/a.apk"),
+            ["plain"]
+        );
+        assert_eq!(
+            filtered_cookie_names(cookies.clone(), "http://127.0.0.1:3080/files/a.apk"),
+            ["secure-ip"]
+        );
+        assert_eq!(
+            filtered_cookie_names(cookies, "http://localhost:3080/files/a.apk"),
+            ["secure-local"]
+        );
+    }
+
+    #[test]
+    fn cookie_filter_enforces_rfc_path_boundaries() {
+        let cookies = vec![
+            fixture_cookie("default", Some("node.example.com"), None, false),
+            fixture_cookie("root", Some("node.example.com"), Some("/"), false),
+            fixture_cookie("files", Some("node.example.com"), Some("/files"), false),
+            fixture_cookie(
+                "files-slash",
+                Some("node.example.com"),
+                Some("/files/"),
+                false,
+            ),
+            fixture_cookie("file", Some("node.example.com"), Some("/file"), false),
+            fixture_cookie("other", Some("node.example.com"), Some("/other"), false),
+            fixture_cookie("relative", Some("node.example.com"), Some("files"), false),
+        ];
+        assert_eq!(
+            filtered_cookie_names(cookies.clone(), "https://node.example.com/files/a.apk"),
+            ["default", "root", "files", "files-slash"]
+        );
+        assert_eq!(
+            filtered_cookie_names(cookies.clone(), "https://node.example.com/files2/a.apk"),
+            ["default", "root"]
+        );
+        assert_eq!(
+            filtered_cookie_names(cookies, "https://node.example.com/files"),
+            ["default", "root", "files"]
+        );
     }
 
     #[test]
