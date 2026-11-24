@@ -23,6 +23,21 @@ const READ_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_REDIRECTS: usize = 5;
 const RENAME_EXCL: u32 = 0x0000_0004;
 
+fn diagnostic_message(stage: &'static str) -> String {
+    format!("[dsh-download] {stage}")
+}
+
+fn diagnostic(stage: &'static str) {
+    eprintln!("{}", diagnostic_message(stage));
+}
+
+fn noted<T>(result: Result<T, String>, stage: &'static str) -> Result<T, String> {
+    result.map_err(|error| {
+        diagnostic(stage);
+        error
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DownloadRequest {
@@ -72,26 +87,39 @@ impl NodeContent {
         state: &Connections,
         action: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), String> {
-        let session = self.session.upgrade().ok_or("节点已关闭或已替换")?;
+        let session = noted(
+            self.session.upgrade().ok_or("节点已关闭或已替换".into()),
+            "owner-expired",
+        )?;
         // Keep this registry lock through action. tabs::close uses the same lock
         // before cancellation/removal, so close linearizes before or after commit.
-        let tabs = state.tabs.lock().map_err(|_| "标签状态不可用")?;
+        let tabs = noted(
+            state.tabs.lock().map_err(|_| "标签状态不可用".into()),
+            "owner-registry-error",
+        )?;
         if session.cancelled.load(Ordering::SeqCst)
             || session.generation.load(Ordering::SeqCst) != self.generation
             || !tabs
                 .get(&self.id)
                 .is_some_and(|current| Arc::ptr_eq(&current, &session))
         {
+            diagnostic("owner-stale");
             return Err("节点已关闭或已替换".into());
         }
-        let origin = state
-            .urls
-            .lock()
-            .map_err(|_| "连接状态不可用")?
-            .get(&self.id)
-            .cloned()
-            .ok_or("未知节点或连接已关闭")?;
+        let origin = noted(
+            state
+                .urls
+                .lock()
+                .map_err(|_| "连接状态不可用".into())
+                .and_then(|urls| {
+                    urls.get(&self.id)
+                        .cloned()
+                        .ok_or("未知节点或连接已关闭".into())
+                }),
+            "owner-origin-missing",
+        )?;
         if origin != self.origin {
+            diagnostic("owner-origin-changed");
             return Err("节点入口已变化，请重试".into());
         }
         action()
@@ -109,31 +137,41 @@ fn require_node_content_state(
     current: &Url,
 ) -> Result<NodeContent, String> {
     if window_label != "main" && window_label != webview_label {
+        diagnostic("identity-window-rejected");
         return Err("仅已登记节点内容页可下载文件".into());
     }
-    let id = webview_label
-        .strip_prefix("dsh-")
-        .ok_or("仅已登记节点内容页可下载文件")?;
-    crate::policy::connection_id(id)?;
-    let session = state
-        .tabs
-        .lock()
-        .map_err(|_| "标签状态不可用")?
-        .get(id)
-        .ok_or("未知节点或连接已关闭")?;
+    let id = noted(
+        webview_label
+            .strip_prefix("dsh-")
+            .ok_or("仅已登记节点内容页可下载文件".into()),
+        "identity-label-rejected",
+    )?;
+    noted(crate::policy::connection_id(id), "identity-id-rejected")?;
+    let session = noted(
+        state
+            .tabs
+            .lock()
+            .map_err(|_| "标签状态不可用".into())
+            .and_then(|tabs| tabs.get(id).ok_or("未知节点或连接已关闭".into())),
+        "identity-unregistered",
+    )?;
     if session.cancelled.load(Ordering::SeqCst) {
+        diagnostic("identity-cancelled");
         return Err("节点已关闭或已替换".into());
     }
-    let origin = state
-        .urls
-        .lock()
-        .map_err(|_| "连接状态不可用")?
-        .get(id)
-        .cloned()
-        .ok_or("未知节点或连接已关闭")?;
+    let origin = noted(
+        state
+            .urls
+            .lock()
+            .map_err(|_| "连接状态不可用".into())
+            .and_then(|urls| urls.get(id).cloned().ok_or("未知节点或连接已关闭".into())),
+        "identity-origin-missing",
+    )?;
     if !same_origin(&origin, current) {
+        diagnostic("identity-origin-mismatch");
         return Err("节点页面来源已变化，请重试".into());
     }
+    diagnostic("identity-accepted");
     Ok(NodeContent {
         id: id.into(),
         origin,
@@ -143,7 +181,10 @@ fn require_node_content_state(
 }
 
 fn require_node_content(app: &AppHandle, webview: &Webview) -> Result<NodeContent, String> {
-    let current = webview.url().map_err(|_| "无法验证节点页面来源")?;
+    let current = noted(
+        webview.url().map_err(|_| "无法验证节点页面来源".into()),
+        "identity-page-url-error",
+    )?;
     require_node_content_state(
         &app.state::<Connections>(),
         webview.label(),
@@ -159,14 +200,18 @@ pub fn authorize_save_download(authority: &mut tauri::ipc::RuntimeAuthority) {
     authority.__allow_command(
         "save_download".into(),
         tauri::utils::acl::ExecutionContext::Remote {
-            url: "http{s}?://*:*/*".parse().expect("HTTP(S) remote URL pattern"),
+            url: "http{s}?://*:*/*"
+                .parse()
+                .expect("HTTP(S) remote URL pattern"),
         },
     );
 }
 
 pub fn file_actions_initialization_script() -> String {
-    let source = include_str!("../../src/file-actions.ts")
-        .replace("export function installFileActionsBridge", "function installFileActionsBridge");
+    let source = include_str!("../../src/file-actions.ts").replace(
+        "export function installFileActionsBridge",
+        "function installFileActionsBridge",
+    );
     format!("(() => {{\n{source}\ninstallFileActionsBridge(window);\n}})();")
 }
 
@@ -176,14 +221,30 @@ pub async fn save_download(
     app: AppHandle,
     request: DownloadRequest,
 ) -> Result<SaveOutcome, String> {
-    let owner = require_node_content(&app, &webview)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    diagnostic("command-start");
+    let owner = noted(
+        require_node_content(&app, &webview),
+        "command-identity-rejected",
+    )?;
+    let result = match tauri::async_runtime::spawn_blocking(move || {
         save_guarded(&app, &webview, request, |action| {
             owner.with_current(&app.state::<Connections>(), action)
         })
     })
     .await
-    .map_err(|_| "下载任务未完成")?
+    {
+        Ok(result) => result,
+        Err(_) => {
+            diagnostic("command-task-error");
+            return Err("下载任务未完成".into());
+        }
+    };
+    match &result {
+        Ok(SaveOutcome::Saved(_)) => diagnostic("command-saved"),
+        Ok(SaveOutcome::Cancelled) => diagnostic("command-cancelled"),
+        Err(_) => diagnostic("command-error"),
+    }
+    result
 }
 
 pub fn save(
@@ -203,34 +264,50 @@ fn save_guarded<F>(
 where
     F: Fn(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
 {
+    diagnostic("save-start");
     with_current(&mut || Ok(()))?;
-    let id = webview
-        .label()
-        .strip_prefix("dsh-")
-        .ok_or("仅已登记节点可下载文件")?;
-    let origin = app
-        .state::<super::Connections>()
-        .urls
-        .lock()
-        .map_err(|_| "连接状态不可用")?
-        .get(id)
-        .cloned()
-        .ok_or("未知节点或连接已关闭")?;
-    let source = validate_source(&request.url, Some(&origin))?;
-    let current = webview.url().map_err(|_| "无法验证节点页面来源")?;
+    let id = noted(
+        webview
+            .label()
+            .strip_prefix("dsh-")
+            .ok_or("仅已登记节点可下载文件".into()),
+        "save-label-rejected",
+    )?;
+    let origin = noted(
+        app.state::<super::Connections>()
+            .urls
+            .lock()
+            .map_err(|_| "连接状态不可用".into())
+            .and_then(|urls| urls.get(id).cloned().ok_or("未知节点或连接已关闭".into())),
+        "save-origin-missing",
+    )?;
+    let source = noted(
+        validate_source(&request.url, Some(&origin)),
+        "source-rejected",
+    )?;
+    let current = noted(
+        webview.url().map_err(|_| "无法验证节点页面来源".into()),
+        "save-page-url-error",
+    )?;
     if !same_origin(&origin, &current) {
+        diagnostic("save-page-origin-changed");
         return Err("节点页面来源已变化，请重试".into());
     }
     let name = safe_file_name(request.name.as_deref().unwrap_or("download"));
     let (destination, overwrite) = match request.mode.as_str() {
         "download" => {
-            let directory = app
-                .path()
-                .download_dir()
-                .map_err(|_| "无法定位系统下载目录")?;
-            (next_available(&directory, &name)?, false)
+            let directory = noted(
+                app.path()
+                    .download_dir()
+                    .map_err(|_| "无法定位系统下载目录".into()),
+                "download-directory-error",
+            )?;
+            diagnostic("download-directory-ready");
+            let destination = noted(next_available(&directory, &name), "download-name-error")?;
+            (destination, false)
         }
         "saveAs" => {
+            diagnostic("dialog-start");
             let window = webview.window();
             let Some(path) = app
                 .dialog()
@@ -239,15 +316,34 @@ where
                 .set_file_name(&name)
                 .blocking_save_file()
             else {
+                diagnostic("dialog-cancelled");
                 return Ok(SaveOutcome::Cancelled);
             };
-            (path.into_path().map_err(|_| "另存为路径无效")?, true)
+            diagnostic("dialog-selected");
+            (
+                noted(
+                    path.into_path().map_err(|_| "另存为路径无效".into()),
+                    "dialog-path-invalid",
+                )?,
+                true,
+            )
         }
-        _ => return Err("下载模式无效".into()),
+        _ => {
+            diagnostic("mode-rejected");
+            return Err("下载模式无效".into());
+        }
     };
-    let cookies = webview
-        .cookies_for_url(source.clone())
-        .map_err(|_| "无法读取节点会话 Cookie")?;
+    let cookies = noted(
+        webview
+            .cookies_for_url(source.clone())
+            .map_err(|_| "无法读取节点会话 Cookie".into()),
+        "cookie-error",
+    )?;
+    diagnostic(if cookies.is_empty() {
+        "cookie-empty"
+    } else {
+        "cookie-ready"
+    });
     let cookie = if cookies.is_empty() {
         None
     } else {
@@ -259,6 +355,7 @@ where
                 .join("; "),
         )
     };
+    diagnostic("transfer-start");
     download_to_path_guarded(
         &source,
         &origin,
@@ -397,7 +494,9 @@ fn download_to_path(
     destination: &Path,
     overwrite: bool,
 ) -> Result<(), String> {
-    download_to_path_guarded(source, origin, cookie, destination, overwrite, &|action| action())
+    download_to_path_guarded(source, origin, cookie, destination, overwrite, &|action| {
+        action()
+    })
 }
 
 fn download_to_path_guarded(
@@ -409,10 +508,19 @@ fn download_to_path_guarded(
     with_current: &dyn Fn(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
 ) -> Result<(), String> {
     with_current(&mut || Ok(()))?;
-    let source = validate_source(source.as_str(), Some(origin))?;
-    let directory = destination.parent().ok_or("下载目标目录无效")?;
-    let mut temporary = NamedTempFile::with_prefix_in(".dsh-download-", directory)
-        .map_err(|_| "无法在下载目录创建临时文件")?;
+    let source = noted(
+        validate_source(source.as_str(), Some(origin)),
+        "source-rejected",
+    )?;
+    let directory = noted(
+        destination.parent().ok_or("下载目标目录无效".into()),
+        "target-invalid",
+    )?;
+    let mut temporary = noted(
+        NamedTempFile::with_prefix_in(".dsh-download-", directory)
+            .map_err(|_| "无法在下载目录创建临时文件".into()),
+        "temp-error",
+    )?;
     let result = stream_download(
         &source,
         origin,
@@ -421,12 +529,21 @@ fn download_to_path_guarded(
         with_current,
     );
     if result.is_ok() {
-        temporary
-            .as_file_mut()
-            .sync_all()
-            .map_err(|_| "无法同步下载临时文件")?;
+        noted(
+            temporary
+                .as_file_mut()
+                .sync_all()
+                .map_err(|_| "无法同步下载临时文件".into()),
+            "sync-error",
+        )?;
         // Owner validation and the visible write share one registry critical section.
-        with_current(&mut || atomic_rename(temporary.path(), destination, overwrite))?;
+        with_current(&mut || {
+            noted(
+                atomic_rename(temporary.path(), destination, overwrite),
+                "rename-error",
+            )
+        })?;
+        diagnostic("commit-complete");
     }
     result
 }
@@ -444,16 +561,21 @@ fn stream_download(
         .timeout(Duration::from_secs(300))
         .redirect(Policy::custom(move |attempt| {
             if !same_origin(&redirect_origin, attempt.url()) {
+                diagnostic("redirect-origin-rejected");
                 attempt.error("下载重定向不得跨 origin")
             } else if attempt.previous().len() >= MAX_REDIRECTS {
+                diagnostic("redirect-limit");
                 attempt.error("下载重定向次数过多")
             } else {
                 attempt.follow()
             }
         }))
         .no_proxy()
-        .build()
-        .map_err(|_| "无法创建下载请求")?;
+        .build();
+    let client = noted(
+        client.map_err(|_| "无法创建下载请求".into()),
+        "client-error",
+    )?;
 
     let mut offset = 0_u64;
     let mut expected_total = None;
@@ -467,22 +589,30 @@ fn stream_download(
         if let Some(cookie) = cookie {
             request = request.header(COOKIE, cookie);
         }
-        let response = request.send().map_err(|_| "下载请求失败")?;
+        let response = noted(
+            request.send().map_err(|_| "下载请求失败".into()),
+            "response-request-error",
+        )?;
         match response.status() {
             StatusCode::OK if offset == 0 => {
                 copy_bounded(response, output, None, with_current)?;
                 return Ok(());
             }
             StatusCode::PARTIAL_CONTENT => {
-                let content_range = response
-                    .headers()
-                    .get(CONTENT_RANGE)
-                    .ok_or("206 响应缺少 Content-Range")?
-                    .to_str()
-                    .map_err(|_| "Content-Range 无效")?;
-                let (actual_end, total) =
-                    parse_content_range(content_range, offset, requested_end)?;
+                let content_range = noted(
+                    response
+                        .headers()
+                        .get(CONTENT_RANGE)
+                        .ok_or("206 响应缺少 Content-Range".into())
+                        .and_then(|value| value.to_str().map_err(|_| "Content-Range 无效".into())),
+                    "response-range-error",
+                )?;
+                let (actual_end, total) = noted(
+                    parse_content_range(content_range, offset, requested_end),
+                    "response-range-error",
+                )?;
                 if expected_total.is_some_and(|expected| expected != total) {
+                    diagnostic("response-total-changed");
                     return Err("下载文件总长度在分块间变化".into());
                 }
                 expected_total = Some(total);
@@ -497,7 +627,10 @@ fn stream_download(
                 }
                 offset = actual_end + 1;
             }
-            _ => return Err("下载服务返回了不符合请求范围的响应".into()),
+            _ => {
+                diagnostic("response-status-error");
+                return Err("下载服务返回了不符合请求范围的响应".into());
+            }
         }
     }
 }
@@ -534,21 +667,29 @@ fn copy_bounded(
     let mut written = 0_u64;
     loop {
         with_current(&mut || Ok(()))?;
-        let count = response
-            .read(&mut buffer)
-            .map_err(|error| format!("下载读取失败：{error}"))?;
+        let count = noted(
+            response
+                .read(&mut buffer)
+                .map_err(|error| format!("下载读取失败：{error}")),
+            "response-read-error",
+        )?;
         if count == 0 {
             break;
         }
         written = written.checked_add(count as u64).ok_or("下载文件过大")?;
         if expected_length.is_some_and(|expected| written > expected) {
+            diagnostic("response-length-error");
             return Err("服务返回了超出 Range 的数据".into());
         }
-        output
-            .write_all(&buffer[..count])
-            .map_err(|_| "下载写入失败")?;
+        noted(
+            output
+                .write_all(&buffer[..count])
+                .map_err(|_| "下载写入失败".into()),
+            "write-error",
+        )?;
     }
     if expected_length.is_some_and(|expected| expected != written) {
+        diagnostic("response-short-read");
         return Err("下载响应短读".into());
     }
     Ok(())
@@ -785,17 +926,20 @@ mod tests {
     fn node_state() -> (Connections, Arc<crate::tabs::TabSession>, Url) {
         let state = Connections::default();
         let origin = Url::parse("https://node.example:8443/").unwrap();
-        let session = state
-            .tabs
-            .lock()
-            .unwrap()
-            .begin(NODE_ID, "Node", 7);
+        let session = state.tabs.lock().unwrap().begin(NODE_ID, "Node", 7);
         state
             .urls
             .lock()
             .unwrap()
             .insert(NODE_ID.into(), origin.clone());
         (state, session, origin)
+    }
+
+    #[test]
+    fn diagnostics_are_fixed_bounded_stage_messages() {
+        let message = diagnostic_message("command-start");
+        assert_eq!(message, "[dsh-download] command-start");
+        assert!(message.len() < 64);
     }
 
     #[test]
@@ -808,6 +952,7 @@ mod tests {
         let label = format!("dsh-{NODE_ID}");
         for url in [
             "https://node.example:8443/files",
+            "https://node.example/files",
             "http://127.0.0.1:41234/files",
         ] {
             let origin = tauri::ipc::Origin::Remote {
@@ -861,11 +1006,7 @@ mod tests {
         let owner = require_node_content_state(&state, &label, "main", &origin).unwrap();
         assert!(owner.is_current(&state).is_ok());
 
-        state
-            .tabs
-            .lock()
-            .unwrap()
-            .mark_failed(&session, 7);
+        state.tabs.lock().unwrap().mark_failed(&session, 7);
         state.tabs.lock().unwrap().begin(NODE_ID, "Node", 8);
         assert!(
             owner.is_current(&state).is_err(),

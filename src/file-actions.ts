@@ -7,38 +7,65 @@
  * @typedef {{url: string, name?: string, mediaType?: string, mode: 'download' | 'saveAs'}} SaveRequest
  * @typedef {{status: 'cancelled'} | {status: 'saved', path: string}} SaveOutcome
  * @typedef {{save(request: SaveRequest): Promise<SaveOutcome>, readClipboardImage(url: string): Promise<never>}} DesktopFileActions
- * @typedef {{__TAURI_INTERNALS__?: {invoke?: (command: string, args?: unknown) => Promise<SaveOutcome>}, dshDesktop?: {fileActions?: DesktopFileActions}}} BridgeRoot
+ * @typedef {{__TAURI_INTERNALS__?: {invoke?: (command: string, args?: unknown) => Promise<SaveOutcome>}, dshDesktop?: {fileActions?: DesktopFileActions}, console?: {info?: (message: string) => void}}} BridgeRoot
  */
+
+function diagnose(root, stage) {
+  root.console?.info?.(`[dsh-download] ${stage}`)
+}
 
 /**
  * @param {BridgeRoot} root
  * @returns {DesktopFileActions}
  */
 export function installFileActionsBridge(root) {
-  if (root.dshDesktop?.fileActions) return root.dshDesktop.fileActions
+  if (root.dshDesktop?.fileActions) {
+    diagnose(root, 'bridge-existing')
+    return root.dshDesktop.fileActions
+  }
   const invoke = root.__TAURI_INTERNALS__?.invoke
-  if (typeof invoke !== 'function') throw new Error('Native file actions are unavailable')
+  if (typeof invoke !== 'function') {
+    diagnose(root, 'bridge-ipc-unavailable')
+    throw new Error('Native file actions are unavailable')
+  }
+  diagnose(root, 'bridge-install')
 
   /** @type {DesktopFileActions} */
   const actions = {
     async save(request) {
+      diagnose(root, 'save-request')
       if (!request || typeof request !== 'object' || Array.isArray(request)) {
+        diagnose(root, 'save-request-rejected')
         throw new Error('Invalid file save request')
       }
       const value = /** @type {Record<string, unknown>} */ (request)
-      if (typeof value.url !== 'string' || !value.url.trim()) throw new Error('Invalid file URL')
+      if (typeof value.url !== 'string' || !value.url.trim()) {
+        diagnose(root, 'save-url-rejected')
+        throw new Error('Invalid file URL')
+      }
       let source
       try {
         source = new URL(value.url)
       } catch {
+        diagnose(root, 'save-url-rejected')
         throw new Error('Invalid file URL')
       }
       if (!['http:', 'https:'].includes(source.protocol) || source.username || source.password || value.url.includes('#')) {
+        diagnose(root, 'save-url-rejected')
         throw new Error('Unsupported file URL')
       }
-      if (value.mode !== 'download' && value.mode !== 'saveAs') throw new Error('Invalid save mode')
-      if (value.name !== undefined && typeof value.name !== 'string') throw new Error('Invalid file name')
-      if (value.mediaType !== undefined && typeof value.mediaType !== 'string') throw new Error('Invalid media type')
+      if (value.mode !== 'download' && value.mode !== 'saveAs') {
+        diagnose(root, 'save-mode-rejected')
+        throw new Error('Invalid save mode')
+      }
+      if (value.name !== undefined && typeof value.name !== 'string') {
+        diagnose(root, 'save-field-rejected')
+        throw new Error('Invalid file name')
+      }
+      if (value.mediaType !== undefined && typeof value.mediaType !== 'string') {
+        diagnose(root, 'save-field-rejected')
+        throw new Error('Invalid media type')
+      }
 
       const clean = {
         url: value.url,
@@ -46,7 +73,19 @@ export function installFileActionsBridge(root) {
         ...(value.name === undefined ? {} : { name: value.name }),
         ...(value.mediaType === undefined ? {} : { mediaType: value.mediaType }),
       }
-      return invoke('save_download', { request: clean })
+      diagnose(root, 'save-ipc-start')
+      try {
+        const outcome = await invoke('save_download', { request: clean })
+        if (outcome?.status === 'saved') diagnose(root, 'save-ipc-saved')
+        else if (outcome?.status === 'cancelled') diagnose(root, 'save-ipc-cancelled')
+        else diagnose(root, 'save-ipc-invalid')
+        return outcome
+      } catch (error) {
+        const message = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+        const aclRejected = /not allowed by ACL|not allowed on (?:origin|window|webview)/i.test(message)
+        diagnose(root, aclRejected ? 'save-ipc-acl-rejected' : 'save-ipc-error')
+        throw error
+      }
     },
     async readClipboardImage() {
       throw new Error('readClipboardImage is unsupported')

@@ -81,4 +81,51 @@ describe('installFileActionsBridge', () => {
     await expect(actions.readClipboardImage(url)).rejects.toThrow(/unsupported/i)
     expect(invoke).not.toHaveBeenCalled()
   })
+
+  it('emits fixed stage diagnostics without URL, cookie, token, path or native error text', async () => {
+    const info = vi.fn()
+    const invoke = vi.fn().mockResolvedValue({ status: 'saved', path: '/Users/test/Downloads/private.apk' })
+    const root = { __TAURI_INTERNALS__: { invoke }, console: { info } }
+    const actions = installFileActionsBridge(root)
+
+    await actions.save({ url: `${url}&token=URL_SENTINEL`, name: 'artifact.apk', mode: 'download', cookie: 'COOKIE_SENTINEL' })
+
+    expect(info.mock.calls.map(call => call[0])).toEqual([
+      '[dsh-download] bridge-install',
+      '[dsh-download] save-request',
+      '[dsh-download] save-ipc-start',
+      '[dsh-download] save-ipc-saved',
+    ])
+    const output = JSON.stringify(info.mock.calls)
+    for (const sentinel of ['URL_SENTINEL', 'COOKIE_SENTINEL', url, '/Users/test/Downloads/private.apk']) {
+      expect(output).not.toContain(sentinel)
+    }
+  })
+
+  it('distinguishes rejected URLs and remote IPC rejection without leaking error text', async () => {
+    const info = vi.fn()
+    const invoke = vi.fn()
+      .mockRejectedValueOnce(new Error('Command not allowed by ACL; URL_SENTINEL COOKIE_SENTINEL'))
+    const root = { __TAURI_INTERNALS__: { invoke }, console: { info } }
+    const actions = installFileActionsBridge(root)
+
+    await expect(actions.save({ url: 'file:///tmp/SECRET_SENTINEL', mode: 'download' })).rejects.toThrow()
+    expect(info).toHaveBeenLastCalledWith('[dsh-download] save-url-rejected')
+    expect(invoke).not.toHaveBeenCalled()
+
+    await expect(actions.save({ url, mode: 'download' })).rejects.toThrow()
+    expect(info).toHaveBeenLastCalledWith('[dsh-download] save-ipc-acl-rejected')
+    const output = JSON.stringify(info.mock.calls)
+    expect(output).not.toContain('URL_SENTINEL')
+    expect(output).not.toContain('COOKIE_SENTINEL')
+    expect(output).not.toContain('SECRET_SENTINEL')
+    expect(output).not.toContain('Command not allowed')
+  })
+
+  it('reports an initialization-time missing native IPC bridge', () => {
+    const info = vi.fn()
+
+    expect(() => installFileActionsBridge({ console: { info } })).toThrow('Native file actions are unavailable')
+    expect(info).toHaveBeenCalledWith('[dsh-download] bridge-ipc-unavailable')
+  })
 })
