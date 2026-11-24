@@ -82,6 +82,21 @@ describe('file actions', () => {
       expect(bridge.save).toHaveBeenCalledWith({ url: source.url, name: source.name, mediaType: source.mediaType, mode })
     } finally { actions.dispose() }
   })
+  it('resolves a desktop bridge installed after the plugin captured undefined', async () => {
+    const bridge = native()
+    const ctx = new Context(), fiber = ctx.plugin({ apply: clientApply })
+    await fiber.await()
+    expect(ctx.fileActions.canSaveAs).toBe(false)
+    vi.stubGlobal('dshDesktop', { fileActions: bridge })
+    const read = vi.fn(async () => { throw new Error('RPC maxFileBytes exceeded (>32MiB)') })
+    const source = { url: 'https://example.com/late.apk', name: 'late.apk', read }
+    try {
+      expect(ctx.fileActions.canSaveAs).toBe(true)
+      await expect(ctx.fileActions.save(source, 'download')).resolves.toEqual({ status: 'saved', path: '/downloads/original.png' })
+      expect(read).not.toHaveBeenCalled()
+      expect(bridge.save).toHaveBeenCalledWith({ url: source.url, name: source.name, mode: 'download' })
+    } finally { await fiber.dispose() }
+  })
   it('uses an authorized resource reader without converting bytes', async () => {
     vi.stubGlobal('Blob', NodeBlob)
     const bridge = native(), actions = new BrowserFileActions(bridge)

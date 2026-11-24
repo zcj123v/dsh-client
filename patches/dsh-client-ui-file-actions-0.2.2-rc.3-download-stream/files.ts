@@ -16,17 +16,19 @@ export function exportName(name: string | undefined, mediaType: string): string 
 export class BrowserFileActions implements FileActions {
   private downloadUrl: string | undefined
   private readonly lifetime = new AbortController()
-  readonly canSaveAs: boolean
-  constructor(private readonly desktop: DesktopFileActions | undefined) {
-    this.canSaveAs = desktop !== undefined
+  get canSaveAs(): boolean { return this.native() !== undefined }
+  constructor(private readonly desktop: DesktopFileActions | undefined) {}
+  private native(): DesktopFileActions | undefined {
+    return this.desktop ?? (window as Window & { dshDesktop?: { fileActions?: DesktopFileActions } }).dshDesktop?.fileActions
   }
   private async read(source: FileActionSource): Promise<Blob> {
     this.lifetime.signal.throwIfAborted()
     if (source.read !== undefined) return source.read(this.lifetime.signal)
     const url = new URL(source.url)
     if (!['http:', 'https:', 'blob:', 'data:', 'dsh-app:'].includes(url.protocol)) throw new Error('Unsupported file source')
-    if (this.desktop !== undefined && ['http:', 'https:'].includes(url.protocol) && url.origin !== location.origin) {
-      const content = await this.desktop.readClipboardImage(url.href)
+    const desktop = this.native()
+    if (desktop !== undefined && ['http:', 'https:'].includes(url.protocol) && url.origin !== location.origin) {
+      const content = await desktop.readClipboardImage(url.href)
       this.lifetime.signal.throwIfAborted()
       return new Blob([new Uint8Array(content.bytes)], { type: content.mediaType || source.mediaType || '' })
     }
@@ -36,13 +38,14 @@ export class BrowserFileActions implements FileActions {
   }
   async save(source: FileActionSource, mode: 'download' | 'saveAs'): Promise<FileSaveResult> {
     this.lifetime.signal.throwIfAborted()
-    if (this.desktop !== undefined) {
+    const desktop = this.native()
+    if (desktop !== undefined) {
       const direct = URL.canParse(source.url) && ['http:', 'https:'].includes(new URL(source.url).protocol)
       const blob = source.read === undefined || direct ? undefined : await source.read(this.lifetime.signal)
       this.lifetime.signal.throwIfAborted()
       const url = blob === undefined ? source.url : URL.createObjectURL(blob)
       try {
-        const result = await this.desktop.save({ url, mode,
+        const result = await desktop.save({ url, mode,
           ...(source.name === undefined ? {} : { name: source.name }),
           ...(blob?.type || source.mediaType ? { mediaType: blob?.type || source.mediaType } : {}),
         })

@@ -31,6 +31,36 @@ fn diagnostic(stage: &'static str) {
     eprintln!("{}", diagnostic_message(stage));
 }
 
+fn diagnostic_title_stage(title: &str) -> Option<&'static str> {
+    const STAGES: &[&str] = &[
+        "bridge-existing",
+        "bridge-ipc-unavailable",
+        "bridge-install",
+        "save-request",
+        "save-request-rejected",
+        "save-url-rejected",
+        "save-mode-rejected",
+        "save-field-rejected",
+        "save-ipc-start",
+        "save-ipc-saved",
+        "save-ipc-cancelled",
+        "save-ipc-invalid",
+        "save-ipc-acl-rejected",
+        "save-ipc-error",
+        "bridge-installed",
+        "bridge-missing",
+        "ipc-unavailable",
+    ];
+    let stage = title.strip_prefix("[dsh-download] ")?;
+    STAGES.iter().copied().find(|candidate| *candidate == stage)
+}
+
+pub fn diagnose_title(title: &str) {
+    if let Some(stage) = diagnostic_title_stage(title) {
+        diagnostic(stage);
+    }
+}
+
 fn noted<T>(result: Result<T, String>, stage: &'static str) -> Result<T, String> {
     result.map_err(|error| {
         diagnostic(stage);
@@ -213,6 +243,24 @@ pub fn file_actions_initialization_script() -> String {
         "function installFileActionsBridge",
     );
     format!("(() => {{\n{source}\ninstallFileActionsBridge(window);\n}})();")
+}
+
+pub fn file_actions_probe_script() -> &'static str {
+    r#"(() => {
+  const report = () => {
+    const title = document.title
+    const installed = typeof window.dshDesktop?.fileActions?.save === 'function'
+    const ipc = typeof window.__TAURI_INTERNALS__?.invoke === 'function'
+    const stage = installed ? 'bridge-installed' : ipc ? 'bridge-missing' : 'ipc-unavailable'
+    const diagnostic = `[dsh-download] ${stage}`
+    document.title = diagnostic
+    setTimeout(() => {
+      if (document.title === diagnostic) document.title = title
+    }, 50)
+  }
+  report()
+  setTimeout(report, 100)
+})();"#
 }
 
 #[tauri::command]
@@ -940,6 +988,66 @@ mod tests {
         let message = diagnostic_message("command-start");
         assert_eq!(message, "[dsh-download] command-start");
         assert!(message.len() < 64);
+    }
+
+    #[test]
+    fn javascript_title_diagnostics_accept_only_recognized_fixed_stages() {
+        for stage in [
+            "bridge-existing",
+            "bridge-ipc-unavailable",
+            "bridge-install",
+            "save-request",
+            "save-request-rejected",
+            "save-url-rejected",
+            "save-mode-rejected",
+            "save-field-rejected",
+            "save-ipc-start",
+            "save-ipc-saved",
+            "save-ipc-cancelled",
+            "save-ipc-invalid",
+            "save-ipc-acl-rejected",
+            "save-ipc-error",
+            "bridge-installed",
+            "bridge-missing",
+            "ipc-unavailable",
+        ] {
+            let title = format!("[dsh-download] {stage}");
+            assert_eq!(diagnostic_title_stage(&title), Some(stage));
+            assert!(title.len() < 64);
+        }
+        for title in [
+            "ORIGINAL_TITLE_SENTINEL",
+            "[dsh-download] URL_SENTINEL",
+            "[dsh-download] bridge-install COOKIE_SENTINEL",
+            "[dsh-download] bridge-install\nPATH_SENTINEL",
+            "prefix [dsh-download] bridge-install",
+        ] {
+            assert_eq!(diagnostic_title_stage(title), None);
+        }
+    }
+
+    #[test]
+    fn generated_page_load_probe_checks_only_booleans_and_restores_title() {
+        let script = file_actions_probe_script();
+        for required in [
+            "typeof window.dshDesktop?.fileActions?.save === 'function'",
+            "typeof window.__TAURI_INTERNALS__?.invoke === 'function'",
+            "'bridge-installed'",
+            "'bridge-missing'",
+            "'ipc-unavailable'",
+            "document.title = diagnostic",
+            "if (document.title === diagnostic) document.title = title",
+            "}, 50)",
+            "setTimeout(report, 100)",
+        ] {
+            assert!(script.contains(required), "probe missing {required}");
+        }
+        for forbidden in [
+            "location", "cookie", "token", "secret", "password", "console", "JSON", "invoke(",
+            "save(",
+        ] {
+            assert!(!script.contains(forbidden), "probe contains {forbidden}");
+        }
     }
 
     #[test]

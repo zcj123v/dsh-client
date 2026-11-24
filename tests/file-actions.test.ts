@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { installFileActionsBridge } from '../src/file-actions'
 
 const url = 'https://node.example:8443/api/file?id=artifact'
@@ -10,6 +10,8 @@ function fixture() {
 }
 
 describe('installFileActionsBridge', () => {
+  afterEach(() => { vi.useRealTimers() })
+
   it.each(['download', 'saveAs'] as const)('forwards a %s request with only the native request fields', async mode => {
     const { invoke, root } = fixture()
     const actions = installFileActionsBridge(root)
@@ -82,50 +84,82 @@ describe('installFileActionsBridge', () => {
     expect(invoke).not.toHaveBeenCalled()
   })
 
-  it('emits fixed stage diagnostics without URL, cookie, token, path or native error text', async () => {
-    const info = vi.fn()
+  it('emits fixed stage titles and asynchronously restores the original title without sensitive values', async () => {
+    vi.useFakeTimers()
+    const titles: string[] = []
+    let title = 'ORIGINAL_TITLE_SENTINEL'
+    const document = {
+      get title() { return title },
+      set title(value: string) { titles.push(value); title = value },
+    }
     const invoke = vi.fn().mockResolvedValue({ status: 'saved', path: '/Users/test/Downloads/private.apk' })
-    const root = { __TAURI_INTERNALS__: { invoke }, console: { info } }
+    const root = { __TAURI_INTERNALS__: { invoke }, document }
     const actions = installFileActionsBridge(root)
 
     await actions.save({ url: `${url}&token=URL_SENTINEL`, name: 'artifact.apk', mode: 'download', cookie: 'COOKIE_SENTINEL' })
 
-    expect(info.mock.calls.map(call => call[0])).toEqual([
+    const stages = titles.filter(value => value.startsWith('[dsh-download] '))
+    expect(stages).toEqual([
       '[dsh-download] bridge-install',
       '[dsh-download] save-request',
       '[dsh-download] save-ipc-start',
       '[dsh-download] save-ipc-saved',
     ])
-    const output = JSON.stringify(info.mock.calls)
-    for (const sentinel of ['URL_SENTINEL', 'COOKIE_SENTINEL', url, '/Users/test/Downloads/private.apk']) {
+    expect(document.title).toBe('[dsh-download] save-ipc-saved')
+    expect(titles).toHaveLength(stages.length)
+    await vi.advanceTimersByTimeAsync(50)
+    expect(document.title).toBe('ORIGINAL_TITLE_SENTINEL')
+    expect(titles).toHaveLength(stages.length + 1)
+    expect(titles.at(-1)).toBe('ORIGINAL_TITLE_SENTINEL')
+    const output = JSON.stringify(stages)
+    for (const sentinel of ['URL_SENTINEL', 'COOKIE_SENTINEL', url, '/Users/test/Downloads/private.apk', 'ORIGINAL_TITLE_SENTINEL']) {
       expect(output).not.toContain(sentinel)
     }
   })
 
   it('distinguishes rejected URLs and remote IPC rejection without leaking error text', async () => {
-    const info = vi.fn()
+    vi.useFakeTimers()
+    const titles: string[] = []
+    let title = 'original'
+    const document = {
+      get title() { return title },
+      set title(value: string) { titles.push(value); title = value },
+    }
     const invoke = vi.fn()
       .mockRejectedValueOnce(new Error('Command not allowed by ACL; URL_SENTINEL COOKIE_SENTINEL'))
-    const root = { __TAURI_INTERNALS__: { invoke }, console: { info } }
+    const root = { __TAURI_INTERNALS__: { invoke }, document }
     const actions = installFileActionsBridge(root)
 
     await expect(actions.save({ url: 'file:///tmp/SECRET_SENTINEL', mode: 'download' })).rejects.toThrow()
-    expect(info).toHaveBeenLastCalledWith('[dsh-download] save-url-rejected')
+    expect(titles.filter(value => value.startsWith('[dsh-download] '))).toContain('[dsh-download] save-url-rejected')
     expect(invoke).not.toHaveBeenCalled()
 
     await expect(actions.save({ url, mode: 'download' })).rejects.toThrow()
-    expect(info).toHaveBeenLastCalledWith('[dsh-download] save-ipc-acl-rejected')
-    const output = JSON.stringify(info.mock.calls)
+    expect(titles.filter(value => value.startsWith('[dsh-download] ')).at(-1)).toBe('[dsh-download] save-ipc-acl-rejected')
+    expect(document.title).toBe('[dsh-download] save-ipc-acl-rejected')
+    await vi.advanceTimersByTimeAsync(50)
+    expect(document.title).toBe('original')
+    const output = JSON.stringify(titles.filter(value => value.startsWith('[dsh-download] ')))
     expect(output).not.toContain('URL_SENTINEL')
     expect(output).not.toContain('COOKIE_SENTINEL')
     expect(output).not.toContain('SECRET_SENTINEL')
     expect(output).not.toContain('Command not allowed')
   })
 
-  it('reports an initialization-time missing native IPC bridge', () => {
-    const info = vi.fn()
+  it('reports an initialization-time missing native IPC bridge through an asynchronously restored title', () => {
+    vi.useFakeTimers()
+    const titles: string[] = []
+    let title = 'original'
+    const document = {
+      get title() { return title },
+      set title(value: string) { titles.push(value); title = value },
+    }
 
-    expect(() => installFileActionsBridge({ console: { info } })).toThrow('Native file actions are unavailable')
-    expect(info).toHaveBeenCalledWith('[dsh-download] bridge-ipc-unavailable')
+    expect(() => installFileActionsBridge({ document })).toThrow('Native file actions are unavailable')
+    expect(titles).toEqual(['[dsh-download] bridge-ipc-unavailable'])
+    expect(document.title).toBe('[dsh-download] bridge-ipc-unavailable')
+    vi.advanceTimersByTime(50)
+    expect(titles).toEqual(['[dsh-download] bridge-ipc-unavailable', 'original'])
+    expect(document.title).toBe('original')
   })
 })

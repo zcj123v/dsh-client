@@ -7,11 +7,22 @@
  * @typedef {{url: string, name?: string, mediaType?: string, mode: 'download' | 'saveAs'}} SaveRequest
  * @typedef {{status: 'cancelled'} | {status: 'saved', path: string}} SaveOutcome
  * @typedef {{save(request: SaveRequest): Promise<SaveOutcome>, readClipboardImage(url: string): Promise<never>}} DesktopFileActions
- * @typedef {{__TAURI_INTERNALS__?: {invoke?: (command: string, args?: unknown) => Promise<SaveOutcome>}, dshDesktop?: {fileActions?: DesktopFileActions}, console?: {info?: (message: string) => void}}} BridgeRoot
+ * @typedef {{__TAURI_INTERNALS__?: {invoke?: (command: string, args?: unknown) => Promise<SaveOutcome>}, dshDesktop?: {fileActions?: DesktopFileActions}, document?: {title: string}}} BridgeRoot
  */
 
+let diagnosticTimer
+let titleToRestore = ''
+
 function diagnose(root, stage) {
-  root.console?.info?.(`[dsh-download] ${stage}`)
+  if (!root.document) return
+  if (diagnosticTimer !== undefined) clearTimeout(diagnosticTimer)
+  if (!root.document.title.startsWith('[dsh-download] ')) titleToRestore = root.document.title
+  const diagnostic = `[dsh-download] ${stage}`
+  root.document.title = diagnostic
+  diagnosticTimer = setTimeout(() => {
+    if (root.document?.title === diagnostic) root.document.title = titleToRestore
+    diagnosticTimer = undefined
+  }, 50)
 }
 
 /**

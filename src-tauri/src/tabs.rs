@@ -462,12 +462,15 @@ pub async fn open_connection(
             .initialization_script(downloads::file_actions_initialization_script())
             .data_store_identifier(partition_id(&record.id))
             .disable_drag_drop_handler()
+            .on_document_title_changed(|_, title| downloads::diagnose_title(&title))
             .on_page_load(|view, payload| {
-                if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
-                    && payload.url().query_pairs().any(|(key, _)| key == "token")
-                {
-                    let _ = view
-                        .eval("history.replaceState(null, '', location.pathname + location.hash)");
+                if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                    if payload.url().query_pairs().any(|(key, _)| key == "token") {
+                        let _ = view.eval(
+                            "history.replaceState(null, '', location.pathname + location.hash)",
+                        );
+                    }
+                    let _ = view.eval(downloads::file_actions_probe_script());
                 }
             })
             .on_navigation(move |url| {
