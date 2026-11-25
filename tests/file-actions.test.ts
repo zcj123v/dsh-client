@@ -219,4 +219,123 @@ describe('official ui-file-actions module hook', () => {
     installFileActionsBridge(second.root)
     expect(loader.load).toBe(wrappedLoad)
   })
+
+  it('wraps a loader assigned after the bridge is installed', async () => {
+    const { invoke, root } = fixture()
+    // Document-start reality: the page installs __ModuleLoader__ only later.
+    installFileActionsBridge(root)
+    const registered = new Map<string, { id: string; factory: (require: unknown) => unknown }>()
+    const loader = { load(record: { id: string; factory: unknown }) { registered.set(record.id, record as never) } }
+    Object.assign(root, { __ModuleLoader__: loader })
+
+    const officialRead = vi.fn(async () => { throw new Error('too-large') })
+    const officialFactory = () => ({
+      inject: [],
+      apply(ctx: { provide: (n: string, v: unknown) => void }) {
+        ctx.provide('fileActions', { canSaveAs: true, save: async () => ({ status: 'saved' }), copyImage: async () => {} })
+      },
+    })
+    loader.load({ id: '@deepseek-ai/dsh-client-ui-file-actions', factory: officialFactory })
+    const provided: Record<string, unknown> = {}
+    const ctx = { provide: (n: string, v: unknown) => { provided[n] = v } }
+    const officialExports = registered.get('@deepseek-ai/dsh-client-ui-file-actions')!.factory({}) as {
+      apply: (ctx: { provide: (n: string, v: unknown) => void }) => void
+    }
+    officialExports.apply(ctx)
+    const actions = provided.fileActions as { save: (s: unknown, m: string) => Promise<unknown>; canSaveAs: boolean }
+
+    const source = { url: 'http://127.0.0.1:40286/api/file?path=/x.apk', name: 'x.apk', read: officialRead }
+    await actions.save(source, 'download')
+    expect(officialRead).not.toHaveBeenCalled()
+    expect(invoke).toHaveBeenCalledWith('save_download', { request: { url: source.url, name: 'x.apk', mode: 'download' } })
+    expect(actions.canSaveAs).toBe(true)
+  })
+
+  it('replaces save on the official actions object so the menu closure skips source.read', async () => {
+    const { invoke, root } = fixture()
+    const registered = new Map<string, { id: string; factory: (require: unknown) => unknown }>()
+    const loader = { load(record: { id: string; factory: unknown }) { registered.set(record.id, record as never) } }
+    Object.assign(root, { __ModuleLoader__: loader })
+    installFileActionsBridge(root)
+
+    const officialRead = vi.fn(async () => { throw new Error('too-large') })
+    const officialSave = vi.fn(async () => ({ status: 'saved' }))
+    const officialCopyImage = async () => {}
+    const officialFactory = () => ({
+      inject: [],
+      apply(ctx: { provide: (n: string, v: unknown) => void }) {
+        ctx.provide('fileActions', { canSaveAs: true, save: officialSave, copyImage: officialCopyImage })
+      },
+    })
+    loader.load({ id: '@deepseek-ai/dsh-client-ui-file-actions', factory: officialFactory })
+    const provides: Array<[string, unknown]> = []
+    const provided: Record<string, unknown> = {}
+    const ctx = { provide: (n: string, v: unknown) => { provides.push([n, v]); provided[n] = v } }
+    const officialExports = registered.get('@deepseek-ai/dsh-client-ui-file-actions')!.factory({}) as {
+      apply: (ctx: { provide: (n: string, v: unknown) => void }) => void
+    }
+    officialExports.apply(ctx)
+    // The context-menu closures hold the official actions object itself.
+    const officialActions = provides.find(([name]) => name === 'fileActions')![1] as {
+      save: (s: unknown, m: string) => Promise<unknown>
+      canSaveAs: boolean
+      copyImage: () => Promise<void>
+    }
+
+    const source = { url: 'http://127.0.0.1:40286/api/file?path=/x.apk', name: 'x.apk', read: officialRead }
+    await officialActions.save(source, 'download')
+    expect(officialRead).not.toHaveBeenCalled()
+    expect(officialSave).not.toHaveBeenCalled()
+    expect(invoke).toHaveBeenCalledWith('save_download', { request: { url: source.url, name: 'x.apk', mode: 'download' } })
+    expect(officialActions.canSaveAs).toBe(true)
+    expect(officialActions.copyImage).toBe(officialCopyImage)
+  })
+
+  it('keeps wrapping registrations after the loader replaces its load function', async () => {
+    const { invoke, root } = fixture()
+    const registered = new Map<string, { id: string; factory: (require: unknown) => unknown }>()
+    const loader = { load(record: { id: string; factory: unknown }) { registered.set(record.id, record as never) } }
+    Object.assign(root, { __ModuleLoader__: loader })
+    installFileActionsBridge(root)
+
+    const makeOfficialFactory = () => () => ({
+      inject: [],
+      apply(ctx: { provide: (n: string, v: unknown) => void }) {
+        ctx.provide('fileActions', { canSaveAs: true, save: async () => ({ status: 'saved' }), copyImage: async () => {} })
+      },
+    })
+    // 初始注册进入队列态 load（官方 bundle 在 HTML 解析期注册）。
+    const queueRegistration = { id: '@deepseek-ai/dsh-client-ui-file-actions', factory: makeOfficialFactory() }
+    loader.load(queueRegistration)
+    // 模块系统 create() 时整体重赋 target.load（live 态）并重放队列里的注册。
+    const liveRegistered = new Map<string, { id: string; factory: (require: unknown) => unknown }>()
+    loader.load = function liveLoad(record: { id: string; factory: unknown }) { liveRegistered.set(record.id, record as never) }
+    loader.load(queueRegistration)
+    // 之后新到的注册（如 HMR 重新加载官方 bundle）只经过 live 态 load，也必须被包装。
+    const liveRegistration = { id: '@deepseek-ai/dsh-client-ui-file-actions', factory: makeOfficialFactory() }
+    loader.load(liveRegistration)
+
+    const materialize = (record: { factory: (require: unknown) => unknown }) => {
+      const provides: Array<[string, unknown]> = []
+      const provided: Record<string, unknown> = {}
+      const ctx = { provide: (n: string, v: unknown) => { provides.push([n, v]); provided[n] = v } }
+      const officialExports = record.factory({}) as {
+        apply: (ctx: { provide: (n: string, v: unknown) => void }) => void
+      }
+      officialExports.apply(ctx)
+      return { provides, provided }
+    }
+    // 队列→live 重放不重复包装：恰好 provide 两次（官方一次 + 补丁一次）。
+    expect(materialize(liveRegistered.get('@deepseek-ai/dsh-client-ui-file-actions')!).provides
+      .filter(([name]) => name === 'fileActions')).toHaveLength(2)
+    const { provides, provided } = materialize(liveRegistration)
+    expect(provides.filter(([name]) => name === 'fileActions')).toHaveLength(2)
+    const actions = provided.fileActions as { save: (s: unknown, m: string) => Promise<unknown>; canSaveAs: boolean }
+
+    const officialRead = vi.fn(async () => { throw new Error('too-large') })
+    const source = { url: 'http://127.0.0.1:40286/api/file?path=/x.apk', name: 'x.apk', read: officialRead }
+    await actions.save(source, 'download')
+    expect(officialRead).not.toHaveBeenCalled()
+    expect(invoke).toHaveBeenCalledWith('save_download', { request: { url: source.url, name: 'x.apk', mode: 'download' } })
+  })
 })

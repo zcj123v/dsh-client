@@ -19,6 +19,7 @@
 let diagnosticTimer
 let titleToRestore = ''
 const wrappedLoaders = new WeakSet()
+const wrappedRegistrations = new WeakSet()
 
 function diagnose(root, stage) {
   if (!root.document) return
@@ -33,55 +34,133 @@ function diagnose(root, stage) {
 }
 
 /**
- * Wrap a page's `__ModuleLoader__` so the official
- * `@deepseek-ai/dsh-client-ui-file-actions` registration grows a patched
- * `fileActions`: `save` forwards the original source URL straight to the
- * native bridge instead of letting the official implementation pre-read the
- * file into a Blob first. The official `apply` still runs untouched (menus,
- * icons, locale), any other module id passes through unchanged, and a loader
- * already wrapped once is left alone so re-injection stays idempotent. If the
+ * Patch one official registration in place: its factory keeps producing the
+ * official exports, but the exported `apply` reroutes `fileActions.save`.
+ * The official `apply` still runs untouched (menus, icons, locale), and if the
  * official shape drifts (factory no longer returns `{apply}`, or `apply` no
  * longer provides a save-capable `fileActions`), the patch silently steps
  * aside and downloads fall back to official behavior.
  *
- * @param {ModuleLoaderTarget | undefined} loader
+ * @param {ModuleRegistration} registration
+ * @param {(source: {url: string, name?: string}, mode: string) => unknown} wrapSave
+ */
+function wrapRegistration(registration, wrapSave) {
+  const officialFactory = registration.factory
+  registration.factory = function (require) {
+    const exports = officialFactory.call(this, require)
+    if (!exports || typeof exports !== 'object' || typeof exports.apply !== 'function') return exports
+    const officialApply = exports.apply
+    exports.apply = function (ctx) {
+      const officialProvide = ctx && typeof ctx === 'object' && typeof ctx.provide === 'function' ? ctx.provide : undefined
+      if (officialProvide === undefined) return officialApply.call(this, ctx)
+      let officialActions = null
+      ctx.provide = function (name, value) {
+        if (name === 'fileActions') officialActions = value
+        return officialProvide.call(this, name, value)
+      }
+      const result = officialApply.call(this, ctx)
+      if (officialActions && typeof officialActions === 'object' && typeof officialActions.save === 'function') {
+        // The official `apply` hands the very same object to the context-menu
+        // closures, so replacing `save` in place reroutes the real download
+        // entry; everything else on the official object stays untouched.
+        officialActions.save = wrapSave
+        const patched = Object.create(officialActions)
+        patched.save = wrapSave
+        officialProvide.call(ctx, 'fileActions', patched)
+      }
+      return result
+    }
+    return exports
+  }
+}
+
+/**
+ * Wrap one `load` function so target registrations get patched on the way in.
+ * Registrations already patched once pass through unchanged, so a record that
+ * the page's module system re-feeds through a later `load` (its `create()`
+ * drains the queue through the freshly assigned live loader) is not wrapped
+ * twice.
+ *
+ * @param {(registration: ModuleRegistration) => void} load
+ * @param {string} targetId
+ * @param {(source: {url: string, name?: string}, mode: string) => unknown} wrapSave
+ */
+function wrapLoadFunction(load, targetId, wrapSave) {
+  return function (registration) {
+    if (wrappedRegistrations.has(registration)
+      || !registration || typeof registration !== 'object'
+      || registration.id !== targetId || typeof registration.factory !== 'function') {
+      return load.call(this, registration)
+    }
+    wrappedRegistrations.add(registration)
+    wrapRegistration(registration, wrapSave)
+    return load.call(this, registration)
+  }
+}
+
+/**
+ * Wrap a page's module loader object. The `load` property becomes an accessor
+ * whose getter returns the wrapped function and whose setter re-wraps whatever
+ * function the page assigns later: the module system's `create()` replaces
+ * `target.load` wholesale when it switches from queue mode to live mode, and
+ * registrations arriving after that must still be patched. Frozen loaders fall
+ * back to a plain wrapped `load`, or to official behavior when even that
+ * cannot stick.
+ *
+ * @param {ModuleLoaderTarget} loader
  * @param {string} targetId
  * @param {(source: {url: string, name?: string}, mode: string) => unknown} wrapSave
  */
 function wrapModuleLoader(loader, targetId, wrapSave) {
-  if (!loader || typeof loader.load !== 'function' || wrappedLoaders.has(loader)) return
+  if (!loader || typeof loader !== 'object' || wrappedLoaders.has(loader)) return
+  const load = loader.load
+  if (typeof load !== 'function') return
   wrappedLoaders.add(loader)
-  const originalLoad = loader.load
-  loader.load = function (registration) {
-    if (!registration || typeof registration !== 'object'
-      || registration.id !== targetId || typeof registration.factory !== 'function') {
-      return originalLoad.call(this, registration)
-    }
-    const officialFactory = registration.factory
-    registration.factory = function (require) {
-      const exports = officialFactory.call(this, require)
-      if (!exports || typeof exports !== 'object' || typeof exports.apply !== 'function') return exports
-      const officialApply = exports.apply
-      exports.apply = function (ctx) {
-        const officialProvide = ctx && typeof ctx === 'object' && typeof ctx.provide === 'function' ? ctx.provide : undefined
-        if (officialProvide === undefined) return officialApply.call(this, ctx)
-        let officialActions = null
-        ctx.provide = function (name, value) {
-          if (name === 'fileActions') officialActions = value
-          return officialProvide.call(this, name, value)
-        }
-        const result = officialApply.call(this, ctx)
-        if (officialActions && typeof officialActions === 'object' && typeof officialActions.save === 'function') {
-          const patched = Object.create(officialActions)
-          patched.save = wrapSave
-          officialProvide.call(ctx, 'fileActions', patched)
-        }
-        return result
-      }
-      return exports
-    }
-    return originalLoad.call(this, registration)
+  const wrapped = wrapLoadFunction(load, targetId, wrapSave)
+  let current = wrapped
+  try {
+    Object.defineProperty(loader, 'load', {
+      configurable: true,
+      enumerable: true,
+      get() { return current },
+      set(value) { current = typeof value === 'function' ? wrapLoadFunction(value, targetId, wrapSave) : value },
+    })
+  } catch {
+    try { loader.load = wrapped } catch { /* frozen loader: official behavior stands */ }
   }
+}
+
+/**
+ * Hook `root.__ModuleLoader__` itself. The initialization script runs at
+ * document start, before the page's inline script installs the module loader
+ * facade, so a plain read would always miss it: the property becomes an
+ * accessor that wraps whatever loader object the page assigns later, before
+ * the page's own `load` calls run. A loader that already exists at install
+ * time is wrapped directly. The page still owns the property — values are
+ * stored and returned verbatim, only their `load` gets wrapped.
+ *
+ * @param {BridgeRoot} root
+ * @param {string} targetId
+ * @param {(source: {url: string, name?: string}, mode: string) => unknown} wrapSave
+ */
+function hookModuleLoaderProperty(root, targetId, wrapSave) {
+  if (!root || typeof root !== 'object') return
+  const existing = root.__ModuleLoader__
+  try {
+    let loader = existing
+    Object.defineProperty(root, '__ModuleLoader__', {
+      configurable: true,
+      enumerable: true,
+      get() { return loader },
+      set(value) {
+        loader = value
+        if (value && typeof value === 'object') wrapModuleLoader(value, targetId, wrapSave)
+      },
+    })
+  } catch {
+    // The property cannot be trapped (frozen or exotic root): wrap what exists.
+  }
+  if (existing && typeof existing === 'object') wrapModuleLoader(existing, targetId, wrapSave)
 }
 
 /**
@@ -161,8 +240,8 @@ export function installFileActionsBridge(root) {
       throw new Error('readClipboardImage is unsupported')
     },
   }
-  wrapModuleLoader(
-    root.__ModuleLoader__,
+  hookModuleLoaderProperty(
+    root,
     '@deepseek-ai/dsh-client-ui-file-actions',
     (source, mode) => actions.save({ url: source.url, name: source.name, mode }),
   )
