@@ -163,3 +163,60 @@ describe('installFileActionsBridge', () => {
     expect(document.title).toBe('original')
   })
 })
+
+describe('official ui-file-actions module hook', () => {
+  it('wraps the official file-actions factory so save skips source.read', async () => {
+    const { invoke, root } = fixture()
+    const registered = new Map<string, { id: string; factory: (require: unknown) => unknown }>()
+    const loader = { load(record: { id: string; factory: unknown }) { registered.set(record.id, record as never) } }
+    Object.assign(root, { __ModuleLoader__: loader })
+    installFileActionsBridge(root)
+
+    // 模拟官方包：apply 时 provide 一个会预读的 actions
+    const officialRead = vi.fn(async () => { throw new Error('too-large') })
+    const officialFactory = () => ({
+      inject: [],
+      apply(ctx: { provide: (n: string, v: unknown) => void }) {
+        ctx.provide('fileActions', { canSaveAs: true, save: async () => ({ status: 'saved' }), copyImage: async () => {} })
+      },
+    })
+    loader.load({ id: '@deepseek-ai/dsh-client-ui-file-actions', factory: officialFactory })
+    const provided: Record<string, unknown> = {}
+    const ctx = { provide: (n: string, v: unknown) => { provided[n] = v } }
+    // 官方模块协议：factory(require) 返回 exports，之后才调 exports.apply(ctx)
+    // （对照真实官方 bundle 与 dsh-client-modules 的 materialize 实现）。
+    const officialExports = registered.get('@deepseek-ai/dsh-client-ui-file-actions')!.factory({}) as {
+      apply: (ctx: { provide: (n: string, v: unknown) => void }) => void
+    }
+    officialExports.apply(ctx)
+    const actions = provided.fileActions as { save: (s: unknown, m: string) => Promise<unknown>; canSaveAs: boolean }
+
+    const source = { url: 'http://127.0.0.1:40286/api/file?path=/x.apk', name: 'x.apk', read: officialRead }
+    await actions.save(source, 'download')
+    expect(officialRead).not.toHaveBeenCalled()
+    expect(invoke).toHaveBeenCalledWith('save_download', { request: { url: source.url, name: 'x.apk', mode: 'download' } })
+    expect(actions.canSaveAs).toBe(true)
+  })
+
+  it('leaves unrelated module ids untouched', () => {
+    const { root } = fixture()
+    const registered = new Map<string, { id: string; factory: unknown }>()
+    const loader = { load(r: { id: string; factory: unknown }) { registered.set(r.id, r) } }
+    installFileActionsBridge(Object.assign(root, { __ModuleLoader__: loader }))
+    const factory = () => ({ apply() {} })
+    loader.load({ id: 'other-plugin', factory })
+    expect(registered.get('other-plugin')!.factory).toBe(factory)
+  })
+
+  it('wraps a shared loader only once across repeated installations', () => {
+    const { root } = fixture()
+    const loader = { load(_r: { id: string; factory: unknown }) {} }
+    Object.assign(root, { __ModuleLoader__: loader })
+    installFileActionsBridge(root)
+    const wrappedLoad = loader.load
+    const second = fixture()
+    Object.assign(second.root, { __ModuleLoader__: loader })
+    installFileActionsBridge(second.root)
+    expect(loader.load).toBe(wrappedLoad)
+  })
+})
