@@ -10,9 +10,9 @@
 
 - `src-tauri/src/downloads.rs`
   - `remote_path_from_url`：从 `api/file?path=<绝对路径>` 解析远端路径，空值或相对路径报「远端路径无效」。
-  - `ssh_read_args`：构造 `ssh [-F config] -o BatchMode=yes -o StrictHostKeyChecking=yes [-l user] <profile> -- cat -- <path>`；`profile`/`user` 沿用 `policy::ssh_args` 的 safe 校验。路径作为 `--` 之后的独立参数传递，只为避免路径含空格或特殊字符时出错。
-  - `stream_ssh_to_file`：spawn `ssh`，stdout 以 64 KiB 缓冲流式写入本地临时文件（不随文件大小增长内存），远端非零退出报「远端读取失败」，不透出远端 stderr。
-  - 保存对话框、下载目录、重名避让（不覆盖既有文件）、同目录 `.dsh-download-*` 临时文件、`sync_all` 后原子 `renameat`（`RENAME_EXCL`）提交；失败或取消删除临时文件。
+  - `ssh_read_args`：构造 `ssh [-F config] -o BatchMode=yes -o StrictHostKeyChecking=yes [-l user] <profile> -- cat -- <path>`；`profile`/`user` 镜像 `policy::ssh_args` 的 safe 校验规则（未直接复用）。路径作为 `--` 之后的独立参数传递，只为避免路径含空格或特殊字符时出错。
+  - `stream_ssh_to_file`：spawn `ssh`，stdout 用 `std::io::copy` 流式写入本地临时文件（固定大小拷贝缓冲，内存不随文件大小增长）；stderr 由旁路线程排空后丢弃（既避免 stderr 管道写满阻塞传输，也不把远端内容带进错误信息）；远端非零退出报「远端读取失败」。
+  - 保存对话框、下载目录、重名避让（不覆盖既有文件）、同目录 `.dsh-download-*` 临时文件、`sync_all` 后原子提交：macOS `renamex_np`，`download` 模式带 `RENAME_EXCL` 杜绝覆盖，`saveAs` 模式在系统对话框确认替换后普通重命名覆盖；失败或取消时临时文件随 `NamedTempFile` 析构删除。
   - IPC ACL：`save_download` 只接受已注册节点 WebView 的调用（origin、窗口、generation 校验）；标签关闭、替换或新 generation 使 pending 保存失效并回收。
 - `src/file-actions.ts`：节点 WebView 的 `window.dshDesktop.fileActions` 桥接，及对官方 UI 包的挂钩（见 §2）。
 - `src-tauri/src/tabs.rs`、`src-tauri/src/lib.rs`：`Connections` 记录每条连接的 `SshTarget { profile, user, config }`，连接建立时写入、关闭时移除；WebView 注入与标签生命周期。
@@ -47,6 +47,7 @@ shasum -a 256 "DSH-Client-<版本>-<标签>-arm64.zip" \
 - 同时记录 ZIP 与 `Contents/MacOS/dsh-client` 两个 SHA-256；发布的是未签名 adhoc 测试包，必须写明版本、架构与两个哈希，不得声称签名/公证。
 - **安装前门禁（2026-11-25 事故后新增）**：用 `.6` runtime 的真实官方 `lib/client.js` 跑一次「Cordis 一致」探针——mock 的 `ctx.provide` 必须对重复服务名抛错（与真实容器一致），经 Rust 注入变换执行当前 `src/file-actions.ts`，确认：官方 `factory` 被包装、`apply` 不抛错、`fileActions` 恰好注册一次、菜单入口实际调用 `save_download` 且 `source.read` 零调用。探针抛错或出现二次注册即停止，不得安装。单测与宽松 mock 探针拦不住这类容器约束（本轮实机教训）。
 - 构建前确认 `.6` 上用于验收的源文件存在并实测哈希（APK 重建后哈希会变，以验收当下为准）。
+- **构建树口径**：本轮 v2 二进制构建于提交 `45de60a` 的工作树，同工作区还含随后以 `0d21192` 单独入库的「JSON 节点配置导入导出」工作线（构建当时其 `config_io.rs`、`tauri-plugin-clipboard-manager` 等改动尚未提交）。因此只检出 ssh-read 的提交序列（`4e2c17a…45de60a`）不等于完整发布树；复现或再次发布必须以分支完整树构建，并在干净检出上重跑一次构建门禁后再安装。
 
 ## 4. 备份与安装（`.13`）
 
@@ -83,33 +84,49 @@ ZIP SHA-256:        95e233aad63683eb9d8a7e537f42ace60914215c6af3210e471cae37bfb1
 
 在 `.13` 连接真实 `.6` DSH，不用公开网页或编译结果替代：
 
-1. 打开节点页面后确认日志出现 `[dsh-download] bridge-installed`；没有该记录不得声称原生链路可用。
+1. 打开节点页面后确认日志出现 `[dsh-download] bridge-installed`；没有该记录不得声称原生链路可用。该阶段可能重复出现（安装脚本 + 探针多次上报），重复本身不算异常；同时留意 `bridge-existing` / `bridge-install` 是安装期上报、`bridge-missing` / `ipc-unavailable` 才是失败。
 2. 非图片文件卡（本轮用 257 MB debug APK）菜单点「另存为…」，系统对话框选「下载」目录保存。
 3. 日志阶段应依次出现（2026-11-25 实测顺序。网页侧阶段经 `document.title` 通道由 Rust 轮询回显，
    `save-ipc-start` 落盘位置滞后到 `dialog-start` 之后、`save-request` 常被下一个阶段覆盖而缺失，均属通道特性、不算乱序错误）：
    `bridge-installed` → `command-start` → `identity-accepted` → `save-start` → `dialog-start` →
    `save-ipc-start` → `dialog-selected` → `transfer-start` → `commit-complete` → `command-saved` → `save-ipc-saved`。
-4. 落盘核对：位置（对话框所选目录）、字节数与 `.6` 源文件一致、SHA-256 与验收当下 `.6` 源文件实测值一致。源文件重建后哈希会变：`56a3ec6e…` 是 11-23 旧 APK 的记录，11-24 重建后为 `344daffb…`；每轮以实测为准。
-5. 取消测试：再点一次「另存为…」并取消；取消发生在系统对话框阶段、先于临时文件创建，预期不产生任何 `.dsh-download-*` 残留，验收时确认所选目录确无残留。覆盖语义分模式：`download` 模式同名自动加序号、从不覆盖既有文件；`saveAs` 模式尊重系统对话框的替换确认——用户在对话框里确认替换后整体替换既有文件（2026-11-25 实测：同名确认替换了 11-18 的旧 APK）。
+4. 落盘核对（2026-11-25 实测）：`~/Downloads/app-universal-debug.apk`，**269164865 字节**，SHA-256
+   `344daffbe1884d22399f64ebc6e34e643c91a652227b79a5240bbcc563e631b0`，与 `.6` 源文件
+   `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`（同字节数、同哈希）逐字节一致。
+   源文件重建后哈希会变：`56a3ec6e…` 是 11-23 旧 APK 的记录，11-24 重建后为 `344daffb…`；每轮以验收当下实测为准。
+5. 取消测试：再点一次「另存为…」并取消。取消发生在系统对话框阶段、先于 `transfer-start` 与 `NamedTempFile` 创建，实测阶段链为
+   `command-start` → `identity-accepted` → `save-start` → `dialog-start` → `save-ipc-start` → `dialog-cancelled` → `command-cancelled` → `save-ipc-cancelled`，
+   无 `transfer-start`；取消后残留检查为 `ls -a ~/Downloads | grep dsh-download`，grep 退出码 1（无匹配）即无 `.dsh-download-*` 残留，上一轮保存的验收文件保留属预期（该列举是否可在 SSH 会话内执行受 TCC 限制，见下条）。
+   覆盖语义分模式：`download` 模式同名自动加序号、从不覆盖既有文件；`saveAs` 模式尊重系统对话框的替换确认——用户在对话框里确认替换后整体替换既有文件（2026-11-25 实测：同名确认替换了 11-18 的旧 APK）。
 6. TCC 注意：SSH 会话对 `~/Downloads` 的目录列举被 macOS TCC 拒绝（`ls` / `find` 报 Operation not permitted），但按路径直接读文件可用（2026-11-25 实测：SSH 会话内 `shasum -a 256 ~/Downloads/<文件名>` 成功）。落盘哈希可在 SSH 会话直接算；残留检查需要目录列举，请用户在 `.13` 本机执行 `ls -a ~/Downloads | grep dsh-download`（期望无输出）回传结果，或先在系统设置为 sshd 授予「下载文件夹」访问。
 
 阶段排障：
 
 - `bridge-missing` / `ipc-unavailable`：节点 WebView 桥接未安装或 IPC 不可用。
-- `save-ipc-acl-rejected`：IPC ACL 拒绝（调用方不是已注册节点 WebView）。
-- `identity-window-rejected` / `identity-cancelled` / `identity-origin-mismatch`：窗口、generation 或 origin 校验失败。
+- `identity-window-rejected` / `identity-cancelled` / `identity-origin-mismatch` / `identity-label-rejected` / `identity-unregistered` / `identity-id-rejected`：窗口、generation、origin 或节点注册校验失败。
 - `command-error`（含「远端读取失败」）：远端 `cat` 非零退出——文件不存在、权限不足、SSH 配置或网络问题；错误信息不透出远端 stderr。
+- `command-identity-rejected` / `save-ipc-acl-rejected`：IPC ACL 拒绝（调用方不是已注册节点 WebView）。
 - 「当前连接不是 SSH 转发，无法下载」：直接模式连接发起的保存。
 - `dialog-cancelled` / `command-cancelled`：用户在系统对话框取消（预期路径）。
-- `owner-stale` / `owner-origin-changed`：标签关闭或替换后旧请求失效（预期保护，不应再落盘）。
+- `owner-stale` / `owner-origin-changed` / `owner-origin-missing`：标签关闭、替换或入口 origin 变化后旧请求失效（预期保护，不应再落盘）。
+- `save-ipc-invalid` / `save-ipc-error` / `command-task-error`：IPC 返回异常或后台任务未完成，需结合 Rust 侧 stderr 排查。
 
-本轮验收记录（2026-11-25）：**部分有证据，完整验收记录未闭环**。v2 已按 §4 安装到 `.13`；14:5x 经受限 SSH 只读复核，主机为 `zcj123vdeMacBook-Air.local` / arm64，当前二进制 SHA-256 为 `d225b14177b3b3de4307224217dce73471436bde0c7baf85696b4f77767b8f00`，与 v2 安装记录一致，客户端进程在运行。本文 §5 已补日志阶段顺序、同名覆盖和 TCC 的部分实测结果，但源文件/落盘文件的逐组字节数与 SHA-256、取消后的残留检查等尚未形成完整逐项记录，因此不把 §5 判为全部通过。v1 因二次 provide 破坏页面启动，已隔离且不得再安装。配置导入导出工作线入库后，原「提交树缺 dialog 插件注册」的注意事项已按约定删除；`pnpm test` / `pnpm typecheck` / `pnpm build`、Rust lib 测试与 Android 策略测试均通过，但编译与测试不等于实机验收。待办：按 §5 补齐落盘哈希、取消残留等逐项证据后，再把本段改为验收完成。
+本轮验收记录（2026-11-25，v2 实机）：**完成**。
+
+- 安装：v2 包/安装记录见 §4；`.13` 主机按 §4.1 只读核对为 `zcj123vdeMacBook-Air.local` / arm64，当前二进制 `d225b141…`、客户端进程 PID 57897，哈希与 v2 ZIP 内二进制一致（本机由 ZIP 独立解包复核）。v1（`490e8cf2…`）因二次 provide 破坏整页启动已隔离，禁止再安装。
+- 保存：菜单「另存为…」→ 系统对话框选 `~/Downloads` → 落盘 `app-universal-debug.apk`，269164865 字节、SHA-256 `344daffb…`，与 `.6` 源文件逐字节一致；阶段链见 §5.3（`bridge-installed` 重复出现属正常）。
+- 取消：阶段链与无残留结论见 §5.5（无 `transfer-start`、grep 退出码 1 表示无 `.dsh-download-*` 残留）。
+- 覆盖：`saveAs` 同名保存经系统对话框确认后整体替换既有文件（§5.5）。
+- 回归：`pnpm test` 70/70（12 个测试文件，`file-actions` 24/24）、`pnpm typecheck` 通过、`pnpm build` 通过、`cargo test --manifest-path src-tauri/Cargo.toml --lib` 为 49 passed / 2 ignored（2 个 ignored 为原有 opt-in 用例）。
+- 口径：以上为 v2 实机验收；编译与测试通过仍不等于验收通过（见 §7）。构建树对应关系见 §3「构建树口径」。
 
 ## 6. 回滚
 
-1. 正常退出客户端（同 §4.3），保留失败版本供排查。
-2. `mv ~/Applications/"DSH Client-0.4.1-before-ssh-read-v2-20261125.app" ~/Applications/"DSH Client.app"`。
-3. 启动旧版并核对二进制 SHA-256 与备份记录一致；不删除用户节点存储或 DSH 凭据。
+1. 正常退出客户端（同 §4.3）。先把当前版本整体移开留档——`mv` 到已存在的 `DSH Client.app` 目录内会变成嵌套，必须先移开：
+   `mv ~/Applications/"DSH Client.app" ~/Applications/"DSH Client-0.4.1-ssh-read-v2-rolled-back-<YYYYMMDD>.app"`。
+2. 换回备份：`mv ~/Applications/"DSH Client-0.4.1-before-ssh-read-v2-20261125.app" ~/Applications/"DSH Client.app"`。
+   v1 备份 `DSH Client-0.4.1-before-ssh-read-20261125.app` 与 v2 备份内容相同，可互换；`DSH Client-0.4.1-ssh-read-broken-20261125.app` 是破坏页面启动的 v1 构建，不得用于回滚或安装。
+3. 启动旧版并核对 `Contents/MacOS/dsh-client` 的 SHA-256 与该备份的构建记录一致；不删除用户节点存储或 DSH 凭据。
 4. 用户已裁定 `.13` 不回滚到 stable 旧版：保留当前预览，直至下一个构建替换。
 
 ## 7. 升级与退役注意
