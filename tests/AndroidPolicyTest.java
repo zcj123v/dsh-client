@@ -19,6 +19,10 @@ public final class AndroidPolicyTest {
         check(!ContentPolicy.externalAllowed("intent://evil"), "intent scheme");
         check(!ContentPolicy.externalAllowed("https://evil.test/#token=private"), "credential fragment");
         check(ContentPolicy.externalAllowed("https://docs.example.test/help"), "ordinary external docs");
-        System.out.println("Android native URL policy: 16 checks passed");
+        check(ContentPolicy.reachableResponse("https://dsh.test/", 401, null), "login gate remains reachable");
+        check(ContentPolicy.reachableResponse("https://dsh.test/", 302, "/login"), "same-origin login redirect");
+        check(!ContentPolicy.reachableResponse("https://dsh.test/", 302, "//other.test/login"), "cross-origin redirect must fall back");
+        check(!ContentPolicy.reachableResponse("https://dsh.test/", 302, null), "redirect without location must fall back");
+        System.out.println("Android native URL policy: 20 checks passed");
     }
 }

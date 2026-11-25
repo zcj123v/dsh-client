@@ -113,3 +113,11 @@ python3 tests/android-instrumentation.py --serial emulator-5580 --suite all --tl
 无TLS参数会明确提示该用例跳过，不能用JUnit总数推断实际执行数；有探针时普通9项全部实际执行（6隔离/状态/TLS+3附件），随后另跑prepare/verify各1项。runner同时检查进程退出码和JUnit文本（am instrument即使测试失败也可能exit0）。两段删除会force-stop所选设备的客户端，因此只用于专用测试设备，不能指向个人在用客户端。
 
 本机最终9+1+1通过，前端14/Rust12/typecheck/build同时通过；独立只读审查household-newapi/gpt-6.1-sol无阻断。真实DSH附件上传/下载、macOS选择器及个人真机仍需后续验收。
+
+## 2026-11-23 配置导入导出验收
+
+从当前工作树构建并验签的 debug APK 为 0.4.1（versionCode 4001，arm64-v8a，minSdk 24，targetSdk 36）。SHA-256 为 `56a3ec6e1cadb61b58432c8e1df4068acda27700056dc4b86d7804a90ce9b5e1`。专用 API 36 模拟器使用 System WebView 133.0.6943.137，安装及冷启动通过。
+
+应用内以测试节点验证粘贴 JSON、预览后明确应用、编辑保留入口、原生剪贴板调用，以及经 Android 系统选择器保存 JSON 和从该文件重新打开导入预览。混合入口提示跳过 SSH 和 HTTP，SSH-only 节点显示缺少可用 HTTPS 入口。混合节点实际启动独立内容 Activity 并加载 `https://example.com/`。默认导出的实测文件包含版本和入口，节点没有 token 字段。
+
+含自签名证书拒绝的仪器测试整套复测 9 项通过，跨进程删除 prepare 和 verify 各 1 项通过。首轮有 1 项附件选择测试未捕获系统选择器，单项及整套复测通过，稳定性待观察。同期前端 46 项、Rust 34 项及 Java URL 策略 20 项通过，Rust 另有 2 项按测试配置跳过。个人 Android 真机、实际 DSH 登录与对话仍待验收。

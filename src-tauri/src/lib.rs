@@ -1,6 +1,6 @@
 #[cfg(target_os = "android")]
 mod android;
-#[cfg(not(target_os = "android"))]
+mod config_io;
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 mod downloads;
@@ -40,7 +40,6 @@ struct Connection {
     id: String,
     name: String,
     mode: String,
-    #[cfg(not(target_os = "android"))]
     endpoints: Option<Vec<endpoints::Endpoint>>,
     url: Option<String>,
     #[cfg(not(target_os = "android"))]
@@ -314,12 +313,14 @@ async fn open_node(
     connection_id(&request_id)?;
     #[cfg(target_os = "android")]
     {
-        return open_connection(window, app, record, token)
-            .await
-            .map(|generation| OpenNodeResult {
-                generation,
-                endpoint_index: 0,
-            });
+        // Select from the ORIGINAL ordered endpoint list: skip SSH, require
+        // HTTPS, and let the native side probe in order for real availability.
+        let candidates = endpoints::android_https_entries(&record, token.as_deref())?;
+        let index = android::open_ordered(&app, &record, candidates).await?;
+        return Ok(OpenNodeResult {
+            generation: 0,
+            endpoint_index: index,
+        });
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -981,6 +982,10 @@ pub fn run() {
     let builder = builder.plugin(android::init());
     #[cfg(not(target_os = "android"))]
     let builder = builder.manage(Connections::default());
+    #[cfg(not(target_os = "android"))]
+    let builder = builder
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init());
     #[cfg(target_os = "macos")]
     let context = {
         let mut context = tauri::generate_context!();
@@ -1000,7 +1005,10 @@ pub fn run() {
             delete_connection,
             close_connection,
             #[cfg(target_os = "macos")]
-            downloads::save_download
+            downloads::save_download,
+            config_io::save_config_file,
+            config_io::copy_config_text,
+            config_io::open_config_source
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

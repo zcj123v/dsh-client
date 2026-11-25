@@ -10,6 +10,8 @@ import { connectionCapabilities } from './platform-capabilities'
 import { supportsNativeTabs, type NativeTab, type NativeTabState } from './native-tabs'
 import { useNativeTabs } from './use-native-tabs'
 import { TabBar, TabChooser } from './TabShell'
+import { ConfigTransfer, type ImportPlan } from './ConfigTransfer'
+import { endpointFingerprint, sameDestinations } from './config-transfer'
 
 const browserStorage = {
   getItem: (key: string) => window.localStorage.getItem(key),
@@ -30,6 +32,7 @@ function App() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [tokens, setTokens] = useState<Record<string, string>>({})
+  const [importedTokens, setImportedTokens] = useState<Record<string, string>>({})
   const [statuses, setStatuses] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
   const openingRequest = useRef<string | null>(null)
@@ -129,25 +132,79 @@ function App() {
 
   function refresh(): void { setConnections(store.list()) }
 
+  function clearTokens(ids: string[]): void {
+    function discard(current: Record<string, string>) {
+      const next = { ...current }
+      for (const id of ids) delete next[id]
+      return next
+    }
+    setTokens(discard)
+    setImportedTokens(discard)
+  }
+
+  async function applyImport(plan: ImportPlan): Promise<void> {
+    if (busy) throw new Error('请等待当前连接操作完成')
+    setBusy(true)
+    try {
+      store.saveBatch(plan.records, plan.retiredIds)
+      clearTokens(plan.retiredIds)
+      setTokens(current => ({ ...current, ...plan.tokens }))
+      setImportedTokens(current => ({ ...current, ...plan.tokens }))
+      for (const id of plan.changedRoutes) delete generations.current[id]
+      setCurrentEntries(current => {
+        const next = { ...current }
+        for (const id of plan.changedRoutes) delete next[id]
+        return next
+      })
+      setStatuses(current => {
+        const next = { ...current }
+        for (const id of plan.changedRoutes) delete next[id]
+        return next
+      })
+      setEditing(null)
+      setDraft(initialDraft)
+      setEntries([blankEndpoint()])
+      refresh()
+      setError('')
+      setNotice(`已导入 ${plan.records.length - plan.updates} 个新节点，更新 ${plan.updates} 个节点`)
+      if (isTauri()) {
+        const closed = await Promise.allSettled(plan.changedRoutes.map(id => invoke(plan.retiredIds.includes(id) ? 'delete_connection' : 'close_connection', { id })))
+        if (closed.some(result => result.status === 'rejected')) setError('配置已保存，但部分旧窗口或旧分区清理失败')
+      }
+
+    } finally { setBusy(false) }
+  }
+
   async function addConnection(event: FormEvent): Promise<void> {
     event.preventDefault()
+    if (busy) return
+    setBusy(true)
     setError('')
     setNotice('')
     try {
-      const record = createConnectionRecord({ ...draft, endpoints: entries }, editing ? () => editing.id : undefined)
-      if (capabilities.android && (connectionEndpoints(record).some(entry => entry.mode !== 'direct' || !entry.url?.startsWith('https://')))) throw new Error('Android 使用已有 HTTPS 入口，不支持 SSH 或本机 HTTP')
-      if (editing) setCurrentEntries(current => { const next = { ...current }; delete next[editing.id]; return next })
-      if (editing) { record.createdAt = editing.createdAt; record.lastOpenedAt = editing.lastOpenedAt }
-      if (editing && isTauri()) await invoke("close_connection", { id: editing.id })
-      store.save(record)
+      let record = createConnectionRecord({ ...draft, endpoints: entries })
+      if (capabilities.android && !connectionEndpoints(record).some(entry => entry.mode === 'direct' && entry.url?.startsWith('https://'))) throw new Error('Android 使用已有 HTTPS 入口，不支持 SSH 或本机 HTTP')
+      const retired = editing && !sameDestinations(editing, record) ? [editing.id] : []
+      if (editing) {
+        record.createdAt = editing.createdAt
+        record.lastOpenedAt = editing.lastOpenedAt
+        record.key = editing.key ?? `local:${editing.id}`
+        if (!retired.length) record = { ...record, id: editing.id, partition: editing.partition }
+      }
+      store.saveBatch([record], retired)
+      clearTokens(retired)
       refresh()
       setDraft(initialDraft)
       setEntries([blankEndpoint()])
       setEditing(null)
-      setNotice('连接已保存')
+      setNotice(retired.length ? '连接已保存，入口目标有变化，请重新登录' : '连接已保存')
+      if (editing && endpointFingerprint(editing) !== endpointFingerprint(record) && isTauri()) {
+        try { await invoke(retired.length ? 'delete_connection' : 'close_connection', { id: editing.id }) }
+        catch { setError('配置已保存，但旧窗口或旧分区清理失败') }
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '连接配置无效')
-    }
+    } finally { setBusy(false) }
   }
 
   async function openConnection(record: ConnectionRecord): Promise<void> {
@@ -171,6 +228,11 @@ function App() {
       }
     }
     if (busy) return
+    if (capabilities.android && !connectionEndpoints(record).some(entry => entry.mode === 'direct' && entry.url?.startsWith('https://'))) {
+      setNotice('')
+      setError('此节点没有 Android 可用的 HTTPS 入口')
+      return
+    }
     setBusy(true)
     openingRequest.current = crypto.randomUUID()
     setError('')
@@ -181,9 +243,7 @@ function App() {
     setStatuses(current => ({ ...current, [record.id]: '正在连接…' }))
     try {
       if (!isTauri()) throw new Error('请在 DSH Client 应用中打开连接；浏览器页面仅用于预览')
-      const result = capabilities.android
-        ? { generation: await invoke<number>('open_connection', { record, token: explicitToken }), endpointIndex: 0 }
-        : await invoke<{ generation: number; endpointIndex: number }>('open_node', { record, token: explicitToken, requestId: openingRequest.current })
+      const result = await invoke<{ generation: number; endpointIndex: number }>('open_node', { record, token: explicitToken, requestId: openingRequest.current })
       generations.current[record.id] = result.generation
       setCurrentEntries(current => ({ ...current, [record.id]: connectionEndpoints(record)[result.endpointIndex]?.label ?? '默认入口' }))
       store.markOpened(record.id)
@@ -203,7 +263,7 @@ function App() {
       if (isTauri()) await invoke('delete_connection', { id: record.id })
       delete generations.current[record.id]
       store.remove(record.id)
-      setTokens(current => { const next = { ...current }; delete next[record.id]; return next })
+      clearTokens([record.id])
       refresh()
       setNotice(capabilities.android ? `已删除 ${record.name}；已加载的浏览分区将在下次启动后请求清理` : `已删除 ${record.name}，并请求系统 WebView 清理该连接的浏览数据`)
     } catch { setError('分区清理失败，连接记录已保留，请重试') }
@@ -251,6 +311,7 @@ function App() {
             <span className="count-badge">{connections.length}</span>
           </div>
           {!capabilities.android && <div className="local-shortcut"><button disabled={busy} className="secondary-button" onClick={addLocal}>添加本机 DSH</button><small>127.0.0.1:3080 · 不启动服务</small></div>}
+          <ConfigTransfer records={connections} tokens={{ ...importedTokens, ...Object.fromEntries(Object.entries(tokens).filter(([, token]) => token.trim())) }} android={capabilities.android} busy={busy} apply={applyImport} />
           {recent.length === 0 ? <div className="empty-state"><div className="empty-icon">⌁</div><p>还没有连接</p><span>输入一个 DSH 地址，或复用 SSH 配置别名。</span></div> : (
             <div className="connection-list">
               {recent.map((record) => <article className="connection-row" key={record.id}>
@@ -259,6 +320,7 @@ function App() {
                   <span className="entry-chain">{connectionEndpoints(record).map(entry => entry.label).join(" → ")}</span>
                   {currentEntries[record.id] && <small>当前入口：{currentEntries[record.id]}</small>}
                   <small role="status">{statuses[record.id] ?? '未打开'}</small>
+                  {importedTokens[record.id] && <button type="button" disabled={busy} onClick={() => clearTokens([record.id])}>清除 {record.name} 的内存 token</button>}
                   <input aria-label={`${record.name} 一次性 token`} type="password" autoComplete="off" placeholder="首次登录 / 认证失效：粘贴 token（不保存）" value={tokens[record.id] ?? ''} onChange={event => { const value = event.currentTarget.value; setTokens(current => ({ ...current, [record.id]: value })) }} />
                 </div>
                 <div className="connection-actions"><button disabled={busy || (nativeTabsEnabled && tabStates.get(record.id) === 'opening' && !tokens[record.id]?.trim())} className="primary-button compact" onClick={() => void openConnection(record)}>打开 / 重试</button><button disabled={busy} className="icon-button" title="编辑连接" onClick={() => editConnection(record)}>✎</button><button disabled={busy} className="icon-button" title="删除连接与浏览数据" onClick={() => void removeConnection(record)}>×</button></div>

@@ -31,10 +31,15 @@ export class ConnectionStore {
   }
   list(): ConnectionRecord[] { return this.records.map(record => ({ ...record, ...(record.endpoints ? { endpoints: record.endpoints.map(endpoint => ({ ...endpoint })) } : {}) })) }
   save(record: ConnectionRecord): void {
-    const clean = sanitizeRecord(record)
-    const index = this.records.findIndex(item => item.id === record.id)
-    this.records = index < 0 ? [...this.records, clean] : this.records.map((item, i) => i === index ? clean : item)
-    this.persist()
+    this.saveBatch([record])
+  }
+  saveBatch(records: ConnectionRecord[], retiredIds: string[] = []): void {
+    const next = new Map(this.records.map(record => [record.id, record]))
+    for (const id of retiredIds) next.delete(id)
+    for (const record of records) next.set(record.id, sanitizeRecord(record))
+    const updated = [...next.values()]
+    this.storage.setItem(STORAGE_KEY, JSON.stringify(updated))
+    this.records = updated
   }
   remove(id: string): void {
     this.records = this.records.filter(record => record.id !== id)

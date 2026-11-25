@@ -27,6 +27,14 @@ public final class ContentPolicy {
         URI left = secure(base), right = secure(target);
         return left != null && right != null && left.getHost().equalsIgnoreCase(right.getHost()) && port(left) == port(right);
     }
+    public static boolean reachableResponse(String base, int code, String location) {
+        if ((code >= 200 && code < 300) || code == 401 || code == 403) return true;
+        if (code < 300 || code >= 400 || location == null || location.isEmpty()) return false;
+        URI root = secure(base);
+        if (root == null) return false;
+        try { return sameOrigin(base, root.resolve(location).toString()); }
+        catch (IllegalArgumentException ignored) { return false; }
+    }
     public static boolean externalAllowed(String value) {
         URI uri = secure(value);
         if (uri == null || uri.getRawFragment() != null) return false;
