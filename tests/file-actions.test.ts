@@ -318,18 +318,26 @@ describe('official ui-file-actions module hook', () => {
     const materialize = (record: { factory: (require: unknown) => unknown }) => {
       const provides: Array<[string, unknown]> = []
       const provided: Record<string, unknown> = {}
-      const ctx = { provide: (n: string, v: unknown) => { provides.push([n, v]); provided[n] = v } }
+      // Cordis semantics: registering the same service name twice throws.
+      const ctx = {
+        provide: (n: string, v: unknown) => {
+          if (n in provided) throw new Error(`service "${n}" has been registered`)
+          provides.push([n, v]); provided[n] = v
+        },
+      }
       const officialExports = record.factory({}) as {
         apply: (ctx: { provide: (n: string, v: unknown) => void }) => void
       }
       officialExports.apply(ctx)
       return { provides, provided }
     }
-    // 队列→live 重放不重复包装：恰好 provide 两次（官方一次 + 补丁一次）。
+    // The hook reroutes `save` in place on the official object, so the
+    // service is provided exactly once (the official call). A second provide
+    // would throw in Cordis and take down the whole page boot.
     expect(materialize(liveRegistered.get('@deepseek-ai/dsh-client-ui-file-actions')!).provides
-      .filter(([name]) => name === 'fileActions')).toHaveLength(2)
+      .filter(([name]) => name === 'fileActions')).toHaveLength(1)
     const { provides, provided } = materialize(liveRegistration)
-    expect(provides.filter(([name]) => name === 'fileActions')).toHaveLength(2)
+    expect(provides.filter(([name]) => name === 'fileActions')).toHaveLength(1)
     const actions = provided.fileActions as { save: (s: unknown, m: string) => Promise<unknown>; canSaveAs: boolean }
 
     const officialRead = vi.fn(async () => { throw new Error('too-large') })

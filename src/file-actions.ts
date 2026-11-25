@@ -63,10 +63,9 @@ function wrapRegistration(registration, wrapSave) {
         // The official `apply` hands the very same object to the context-menu
         // closures, so replacing `save` in place reroutes the real download
         // entry; everything else on the official object stays untouched.
+        // Do NOT provide the service a second time — Cordis rejects a
+        // duplicate service registration and the whole page boot fails.
         officialActions.save = wrapSave
-        const patched = Object.create(officialActions)
-        patched.save = wrapSave
-        officialProvide.call(ctx, 'fileActions', patched)
       }
       return result
     }
