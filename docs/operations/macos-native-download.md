@@ -65,14 +65,17 @@ shasum -a 256 "DSH-Client-<版本>-<标签>-arm64.zip" \
    日志行形如 `[dsh-download] <stage>`，阶段名为固定集合，不含 URL、Cookie、token、文件内容或路径。
 8. 不注册自启；不重启、不干预 `.13` 上任何 DSH worker；不使用 `launchctl submit`。
 
-当前安装记录（2026-11-25）：
+当前安装记录（2026-11-25，v2）：
 
 ```text
-ZIP:   DSH-Client-0.4.1-macos-ssh-read-arm64.zip
-ZIP SHA-256:        f76c825f916f7c768414a7a97c79b759bf5334b7d775a44b9392f2ff49624efb
-二进制 SHA-256:      490e8cf2a489e69e5c0ad18400a093ab3d4874a26c6ec4c5316a632c04f463fb
-（版本 0.4.1，arm64，adhoc 未签名）
-回滚备份:           ~/Applications/DSH Client-0.4.1-before-ssh-read-20261125.app
+ZIP:   DSH-Client-0.4.1-macos-ssh-read-v2-arm64.zip
+ZIP SHA-256:        95e233aad63683eb9d8a7e537f42ace60914215c6af3210e471cae37bfb1d3b7
+二进制 SHA-256:      d225b14177b3b3de4307224217dce73471436bde0c7baf85696b4f77767b8f00
+（版本 0.4.1，arm64，adhoc 未签名；含 45de60a 二次 provide 修复）
+回滚备份:           ~/Applications/DSH Client-0.4.1-before-ssh-read-v2-20261125.app（0.4.1 cookie-fix 版，83ad219…）
+历史:               v1 构建（490e8cf2…，ZIP f76c825f…）因二次 provide 破坏整页启动，已停放在
+                     ~/Applications/DSH Client-0.4.1-ssh-read-broken-20261125.app，勿再安装；
+                     v1 备份 DSH Client-0.4.1-before-ssh-read-20261125.app 与 v2 备份内容相同
 更早备份链:         DSH Client-0.4.1-before-cookie-fix-20261124.app 等
 ```
 
@@ -82,11 +85,13 @@ ZIP SHA-256:        f76c825f916f7c768414a7a97c79b759bf5334b7d775a44b9392f2ff4962
 
 1. 打开节点页面后确认日志出现 `[dsh-download] bridge-installed`；没有该记录不得声称原生链路可用。
 2. 非图片文件卡（本轮用 257 MB debug APK）菜单点「另存为…」，系统对话框选「下载」目录保存。
-3. 日志阶段应依次出现（真实代码顺序，`save-ipc-start` 是网页侧阶段、先于 Rust 命令）：
-   `bridge-installed` → `save-request` → `save-ipc-start` → `command-start` → `identity-accepted` → `save-start` → `dialog-start` → `dialog-selected` → `transfer-start` → `commit-complete` → `command-saved` → `save-ipc-saved`。
+3. 日志阶段应依次出现（2026-11-25 实测顺序。网页侧阶段经 `document.title` 通道由 Rust 轮询回显，
+   `save-ipc-start` 落盘位置滞后到 `dialog-start` 之后、`save-request` 常被下一个阶段覆盖而缺失，均属通道特性、不算乱序错误）：
+   `bridge-installed` → `command-start` → `identity-accepted` → `save-start` → `dialog-start` →
+   `save-ipc-start` → `dialog-selected` → `transfer-start` → `commit-complete` → `command-saved` → `save-ipc-saved`。
 4. 落盘核对：位置（对话框所选目录）、字节数与 `.6` 源文件一致、SHA-256 与验收当下 `.6` 源文件实测值一致。源文件重建后哈希会变：`56a3ec6e…` 是 11-23 旧 APK 的记录，11-24 重建后为 `344daffb…`；每轮以实测为准。
-5. 取消测试：再点一次「另存为…」并取消，确认所选目录无 `.dsh-download-*` 临时文件残留；同名再次保存不覆盖既有文件（自动加序号）。
-6. TCC 注意：SSH 会话读 `~/Downloads` 受 macOS TCC 限制（`ls` 报 Operation not permitted）。核验时若屏幕出现『"sshd"想访问"下载"文件夹』弹窗，请用户点「允许」；若始终被拒，请用户在 `.13` 本机执行 `shasum -a 256 ~/Downloads/<文件名>` 回传结果，或先在系统设置授权。
+5. 取消测试：再点一次「另存为…」并取消；取消发生在系统对话框阶段、先于临时文件创建，预期不产生任何 `.dsh-download-*` 残留，验收时确认所选目录确无残留。覆盖语义分模式：`download` 模式同名自动加序号、从不覆盖既有文件；`saveAs` 模式尊重系统对话框的替换确认——用户在对话框里确认替换后整体替换既有文件（2026-11-25 实测：同名确认替换了 11-18 的旧 APK）。
+6. TCC 注意：SSH 会话对 `~/Downloads` 的目录列举被 macOS TCC 拒绝（`ls` / `find` 报 Operation not permitted），但按路径直接读文件可用（2026-11-25 实测：SSH 会话内 `shasum -a 256 ~/Downloads/<文件名>` 成功）。落盘哈希可在 SSH 会话直接算；残留检查需要目录列举，请用户在 `.13` 本机执行 `ls -a ~/Downloads | grep dsh-download`（期望无输出）回传结果，或先在系统设置为 sshd 授予「下载文件夹」访问。
 
 阶段排障：
 
@@ -98,12 +103,12 @@ ZIP SHA-256:        f76c825f916f7c768414a7a97c79b759bf5334b7d775a44b9392f2ff4962
 - `dialog-cancelled` / `command-cancelled`：用户在系统对话框取消（预期路径）。
 - `owner-stale` / `owner-origin-changed`：标签关闭或替换后旧请求失效（预期保护，不应再落盘）。
 
-本轮验收记录（2026-11-25）：**未完成**。ssh-read 版已按 §4 安装到 `.13`（哈希见上），但 §5 的落盘验收（日志阶段链、字节数与 SHA-256 核对、取消与同名保存测试）未见执行记录；对应会话在写本文档时被上游 API 故障中断。收尾提交（「配置导入导出」工作线 + 本文档）时只复跑了 `pnpm test` / `pnpm typecheck` / `pnpm build`、`cargo test --manifest-path src-tauri/Cargo.toml --lib` 与 Android 策略测试（均通过；`lifecycle_tests::lost_forward_recovers_in_place` 在并发首跑时偶发失败，单测与全量重跑通过），编译与测试通过不等于验收通过。配置导入导出工作线入库后，原「提交树缺 dialog 插件注册」的注意事项已按其约定删除。待办：在 `.13` 按 §5 完成实机验收并补记哈希；完成前不得声称原生下载 / SSH 读文件已验收。
+本轮验收记录（2026-11-25）：**部分有证据，完整验收记录未闭环**。v2 已按 §4 安装到 `.13`；14:5x 经受限 SSH 只读复核，主机为 `zcj123vdeMacBook-Air.local` / arm64，当前二进制 SHA-256 为 `d225b14177b3b3de4307224217dce73471436bde0c7baf85696b4f77767b8f00`，与 v2 安装记录一致，客户端进程在运行。本文 §5 已补日志阶段顺序、同名覆盖和 TCC 的部分实测结果，但源文件/落盘文件的逐组字节数与 SHA-256、取消后的残留检查等尚未形成完整逐项记录，因此不把 §5 判为全部通过。v1 因二次 provide 破坏页面启动，已隔离且不得再安装。配置导入导出工作线入库后，原「提交树缺 dialog 插件注册」的注意事项已按约定删除；`pnpm test` / `pnpm typecheck` / `pnpm build`、Rust lib 测试与 Android 策略测试均通过，但编译与测试不等于实机验收。待办：按 §5 补齐落盘哈希、取消残留等逐项证据后，再把本段改为验收完成。
 
 ## 6. 回滚
 
 1. 正常退出客户端（同 §4.3），保留失败版本供排查。
-2. `mv ~/Applications/"DSH Client-0.4.1-before-ssh-read-20261125.app" ~/Applications/"DSH Client.app"`。
+2. `mv ~/Applications/"DSH Client-0.4.1-before-ssh-read-v2-20261125.app" ~/Applications/"DSH Client.app"`。
 3. 启动旧版并核对二进制 SHA-256 与备份记录一致；不删除用户节点存储或 DSH 凭据。
 4. 用户已裁定 `.13` 不回滚到 stable 旧版：保留当前预览，直至下一个构建替换。
 
