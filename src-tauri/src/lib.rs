@@ -132,6 +132,8 @@ struct Connections {
     opening_nodes: Mutex<std::collections::HashSet<String>>,
     #[cfg(target_os = "macos")]
     tabs: Mutex<tabs::TabRegistry>,
+    #[cfg(target_os = "macos")]
+    ssh: Mutex<HashMap<String, downloads::SshTarget>>,
 }
 
 fn require_shell(window: &Webview) -> Result<(), String> {

@@ -245,6 +245,11 @@ pub fn close(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
         .lock()
         .map_err(|_| "标签状态不可用")?
         .remove(id);
+    app.state::<Connections>()
+        .ssh
+        .lock()
+        .map_err(|_| "标签状态不可用")?
+        .remove(id);
     super::emit_shell_event(
         app,
         "connection-status",
@@ -397,24 +402,26 @@ pub async fn open_connection(
             let port = local_port(&record.id);
             let reservation =
                 TcpListener::bind(("127.0.0.1", port)).map_err(|_| "本地转发端口被占用")?;
-            let config = match record.ssh_config.as_deref() {
-                None | Some("default") => None,
-                Some("none") => Some(std::path::PathBuf::from("/dev/null")),
-                Some("fleet") => Some(
-                    app.path()
-                        .home_dir()
-                        .map_err(|_| "无法定位 SSH 配置")?
-                        .join(".ssh/dsh-fleet-config"),
-                ),
-                _ => return Err("SSH 配置无效".into()),
-            };
+            let config = downloads::resolve_ssh_config(app, record.ssh_config.as_deref())?;
+            let profile = record.ssh_profile.clone().ok_or("缺少 SSH Host")?;
+            let user = record.ssh_user.clone().filter(|u| !u.is_empty());
             let args = ssh_args(
-                record.ssh_profile.as_deref().ok_or("缺少 SSH Host")?,
-                record.ssh_user.as_deref().filter(|u| !u.is_empty()),
+                profile.as_str(),
+                user.as_deref(),
                 record.remote_port,
                 port,
                 config.as_ref().and_then(|p| p.to_str()),
             )?;
+            // Recorded before the tunnel exists: save_download needs this
+            // endpoint to stream remote files over the same connection.
+            app.state::<Connections>()
+                .ssh
+                .lock()
+                .map_err(|_| "SSH 状态不可用")?
+                .insert(
+                    record.id.clone(),
+                    downloads::SshTarget { profile, user, config },
+                );
             let base = tauri::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
             login_url(base.clone(), token.as_deref())?;
             ensure_active(&session)?;

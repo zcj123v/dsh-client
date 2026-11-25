@@ -1,27 +1,16 @@
 use crate::{Connections, policy::same_origin, tabs::TabSession};
-use reqwest::{
-    StatusCode,
-    blocking::{Client, Response},
-    header::{CONTENT_RANGE, COOKIE, RANGE},
-    redirect::Policy,
-};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use std::{
     ffi::CString,
     fs,
-    io::{Read, Write},
-    net::IpAddr,
+    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, Weak, atomic::Ordering},
-    time::Duration,
 };
-use tauri::{AppHandle, Manager, Url, Webview, webview::Cookie};
+use tauri::{AppHandle, Manager, Url, Webview};
 use tauri_plugin_dialog::DialogExt;
 use tempfile::NamedTempFile;
 
-const CHUNK_SIZE: u64 = 1024 * 1024;
-const READ_BUFFER_SIZE: usize = 64 * 1024;
-const MAX_REDIRECTS: usize = 5;
 const RENAME_EXCL: u32 = 0x0000_0004;
 
 fn diagnostic_message(stage: &'static str) -> String {
@@ -331,9 +320,10 @@ where
         "save-origin-missing",
     )?;
     let source = noted(
-        validate_source(&request.url, Some(&origin)),
+        Url::parse(&request.url).map_err(|_| "下载 URL 无效".into()),
         "source-rejected",
     )?;
+    let remote_path = noted(remote_path_from_url(&source), "source-rejected")?;
     let current = noted(
         webview.url().map_err(|_| "无法验证节点页面来源".into()),
         "save-page-url-error",
@@ -342,6 +332,27 @@ where
         diagnostic("save-page-origin-changed");
         return Err("节点页面来源已变化，请重试".into());
     }
+    let target = noted(
+        app.state::<super::Connections>()
+            .ssh
+            .lock()
+            .map_err(|_| "连接状态不可用".into())
+            .and_then(|ssh| {
+                ssh.get(id)
+                    .cloned()
+                    .ok_or("当前连接不是 SSH 转发，无法下载".into())
+            }),
+        "ssh-target-missing",
+    )?;
+    let args = noted(
+        ssh_read_args(
+            &target.profile,
+            target.user.as_deref(),
+            target.config.as_deref().and_then(|path| path.to_str()),
+            &remote_path,
+        ),
+        "ssh-args-rejected",
+    )?;
     let name = safe_file_name(request.name.as_deref().unwrap_or("download"));
     let (destination, overwrite) = match request.mode.as_str() {
         "download" => {
@@ -382,173 +393,67 @@ where
             return Err("下载模式无效".into());
         }
     };
-    let cookies = noted(
-        webview
-            .cookies()
-            .map_err(|_| "无法读取节点会话 Cookie".into()),
-        "cookie-error",
-    )?;
-    let cookies = filter_cookies_for_source(cookies, &source);
-    diagnostic(if cookies.is_empty() {
-        "cookie-empty"
-    } else {
-        "cookie-ready"
-    });
-    let cookie = if cookies.is_empty() {
-        None
-    } else {
-        Some(
-            cookies
-                .iter()
-                .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
-    };
     diagnostic("transfer-start");
-    download_to_path_guarded(
-        &source,
-        &origin,
-        cookie.as_deref(),
-        &destination,
-        overwrite,
-        &with_current,
+    let directory = noted(
+        destination.parent().ok_or("下载目标目录无效".into()),
+        "target-invalid",
     )?;
+    let mut temporary = noted(
+        NamedTempFile::with_prefix_in(".dsh-download-", directory)
+            .map_err(|_| "无法在下载目录创建临时文件".into()),
+        "temp-error",
+    )?;
+    noted(
+        stream_ssh_to_file(&args, temporary.as_file_mut()),
+        "transfer-error",
+    )?;
+    noted(
+        temporary
+            .as_file_mut()
+            .sync_all()
+            .map_err(|_| "无法同步下载临时文件".into()),
+        "sync-error",
+    )?;
+    // Owner validation and the visible write share one registry critical section.
+    with_current(&mut || {
+        noted(
+            atomic_rename(temporary.path(), &destination, overwrite),
+            "rename-error",
+        )
+    })?;
+    diagnostic("commit-complete");
     Ok(SaveOutcome::Saved(destination))
 }
 
-fn filter_cookies_for_source(cookies: Vec<Cookie<'static>>, source: &Url) -> Vec<Cookie<'static>> {
-    cookies
-        .into_iter()
-        .filter(|cookie| {
-            cookie_domain_matches(cookie, source)
-                && cookie_secure_matches(cookie, source)
-                && cookie_path_matches(cookie, source)
-        })
-        .collect()
+/// Per-node SSH endpoint recorded when its forwarding tunnel is created.
+/// `save_download` reuses it to stream remote files over the same connection.
+#[derive(Clone, Debug)]
+pub struct SshTarget {
+    pub profile: String,
+    pub user: Option<String>,
+    pub config: Option<PathBuf>,
 }
 
-fn normalized_source_host(source: &Url) -> Option<String> {
-    let host = source
-        .host_str()?
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    (!host.is_empty()).then_some(host)
+pub fn resolve_ssh_config(
+    app: &AppHandle,
+    ssh_config: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    map_ssh_config(app.path().home_dir().ok(), ssh_config)
 }
 
-fn cookie_domain_matches(cookie: &Cookie<'_>, source: &Url) -> bool {
-    let Some(mut source_host) = normalized_source_host(source) else {
-        return false;
-    };
-    // A missing Domain cannot be tied back to its host after reading the whole store.
-    let Some(raw_domain) = cookie.domain() else {
-        return false;
-    };
-    if raw_domain.is_empty() || raw_domain.starts_with('.') {
-        return false;
+fn map_ssh_config(
+    app_home: Option<PathBuf>,
+    option: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    match option {
+        None | Some("default") => Ok(None),
+        Some("none") => Ok(Some(PathBuf::from("/dev/null"))),
+        Some("fleet") => match app_home {
+            Some(home) => Ok(Some(home.join(".ssh/dsh-fleet-config"))),
+            None => Err("无法定位 SSH 配置".into()),
+        },
+        _ => Err("SSH 配置无效".into()),
     }
-    let domain = raw_domain.trim_end_matches('.').to_ascii_lowercase();
-    source_host = source_host.trim_end_matches('.').to_ascii_lowercase();
-    if let Ok(source_ip) = source_host.parse::<IpAddr>() {
-        return domain
-            .parse::<IpAddr>()
-            .is_ok_and(|cookie_ip| cookie_ip == source_ip);
-    }
-    if domain.parse::<IpAddr>().is_ok() {
-        return false;
-    }
-    // The Cookie API strips a leading Domain dot, so subdomain scope cannot be
-    // distinguished safely from host-only scope. Fail closed to an exact host.
-    source_host == domain
-}
-
-fn cookie_secure_matches(cookie: &Cookie<'_>, source: &Url) -> bool {
-    if !cookie.secure().unwrap_or(false) || source.scheme() == "https" {
-        return true;
-    }
-    if source.scheme() != "http" {
-        return false;
-    }
-    normalized_source_host(source).is_some_and(|host| {
-        host == "localhost"
-            || host
-                .parse::<IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    })
-}
-
-fn cookie_path_matches(cookie: &Cookie<'_>, source: &Url) -> bool {
-    let request_path = source.path();
-    let cookie_path = cookie.path().unwrap_or("/");
-    if cookie_path == "/" {
-        return true;
-    }
-    if !cookie_path.starts_with('/') {
-        return false;
-    }
-    request_path == cookie_path
-        || request_path
-            .strip_prefix(cookie_path)
-            .is_some_and(|remainder| cookie_path.ends_with('/') || remainder.starts_with('/'))
-}
-
-fn validate_source(raw: &str, registered_origin: Option<&Url>) -> Result<Url, String> {
-    let origin = registered_origin.ok_or("未知节点或连接已关闭")?;
-    let source = Url::parse(raw).map_err(|_| "下载 URL 无效")?;
-    if source.fragment().is_some() {
-        return Err("下载 URL 不得包含 fragment".into());
-    }
-    for url in [origin, &source] {
-        let loopback =
-            [Some("127.0.0.1"), Some("localhost"), Some("[::1]")].contains(&url.host_str());
-        if url.host_str().is_none()
-            || !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
-        {
-            return Err("下载仅允许同源 HTTPS 或 loopback HTTP".into());
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err("下载 URL 不得包含用户名或密码".into());
-        }
-    }
-    if !same_origin(origin, &source) {
-        return Err("下载 URL 必须与当前节点同源".into());
-    }
-    if source.query_pairs().any(|(key, _)| {
-        let normalized = key
-            .chars()
-            .filter(|character| character.is_ascii_alphanumeric())
-            .map(|character| character.to_ascii_lowercase())
-            .collect::<String>();
-        [
-            "token",
-            "accesstoken",
-            "refreshtoken",
-            "idtoken",
-            "authtoken",
-            "password",
-            "passwd",
-            "pwd",
-            "secret",
-            "clientsecret",
-            "authorization",
-            "auth",
-            "apikey",
-            "credential",
-            "credentials",
-            "session",
-            "sessionid",
-            "cookie",
-            "signature",
-            "sig",
-            "privatekey",
-        ]
-        .contains(&normalized.as_str())
-    }) {
-        return Err("下载 URL 不得携带凭据".into());
-    }
-    Ok(source)
 }
 
 fn remote_path_from_url(url: &Url) -> Result<String, String> {
@@ -654,166 +559,6 @@ fn next_available(directory: &Path, name: &str) -> Result<PathBuf, String> {
     Err("无法分配不重复的下载文件名".into())
 }
 
-fn download(
-    source: &Url,
-    origin: &Url,
-    cookie: Option<&str>,
-    directory: &Path,
-    suggested_name: &str,
-) -> Result<PathBuf, String> {
-    let destination = next_available(directory, &safe_file_name(suggested_name))?;
-    download_to_path(source, origin, cookie, &destination, false)?;
-    Ok(destination)
-}
-
-fn download_to_path(
-    source: &Url,
-    origin: &Url,
-    cookie: Option<&str>,
-    destination: &Path,
-    overwrite: bool,
-) -> Result<(), String> {
-    download_to_path_guarded(source, origin, cookie, destination, overwrite, &|action| {
-        action()
-    })
-}
-
-fn download_to_path_guarded(
-    source: &Url,
-    origin: &Url,
-    cookie: Option<&str>,
-    destination: &Path,
-    overwrite: bool,
-    with_current: &dyn Fn(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
-) -> Result<(), String> {
-    with_current(&mut || Ok(()))?;
-    let source = noted(
-        validate_source(source.as_str(), Some(origin)),
-        "source-rejected",
-    )?;
-    let directory = noted(
-        destination.parent().ok_or("下载目标目录无效".into()),
-        "target-invalid",
-    )?;
-    let mut temporary = noted(
-        NamedTempFile::with_prefix_in(".dsh-download-", directory)
-            .map_err(|_| "无法在下载目录创建临时文件".into()),
-        "temp-error",
-    )?;
-    let result = stream_download(
-        &source,
-        origin,
-        cookie,
-        temporary.as_file_mut(),
-        with_current,
-    );
-    if result.is_ok() {
-        noted(
-            temporary
-                .as_file_mut()
-                .sync_all()
-                .map_err(|_| "无法同步下载临时文件".into()),
-            "sync-error",
-        )?;
-        // Owner validation and the visible write share one registry critical section.
-        with_current(&mut || {
-            noted(
-                atomic_rename(temporary.path(), destination, overwrite),
-                "rename-error",
-            )
-        })?;
-        diagnostic("commit-complete");
-    }
-    result
-}
-
-fn stream_download(
-    source: &Url,
-    origin: &Url,
-    cookie: Option<&str>,
-    output: &mut fs::File,
-    with_current: &dyn Fn(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
-) -> Result<(), String> {
-    let redirect_origin = origin.clone();
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(300))
-        .redirect(Policy::custom(move |attempt| {
-            if !same_origin(&redirect_origin, attempt.url()) {
-                diagnostic("redirect-origin-rejected");
-                attempt.error("下载重定向不得跨 origin")
-            } else if attempt.previous().len() >= MAX_REDIRECTS {
-                diagnostic("redirect-limit");
-                attempt.error("下载重定向次数过多")
-            } else {
-                attempt.follow()
-            }
-        }))
-        .no_proxy()
-        .build();
-    let client = noted(
-        client.map_err(|_| "无法创建下载请求".into()),
-        "client-error",
-    )?;
-
-    let mut offset = 0_u64;
-    let mut expected_total = None;
-    loop {
-        with_current(&mut || Ok(()))?;
-        let block_end = offset.checked_add(CHUNK_SIZE - 1).ok_or("下载文件过大")?;
-        let requested_end = expected_total.map_or(block_end, |total: u64| block_end.min(total - 1));
-        let mut request = client
-            .get(source.clone())
-            .header(RANGE, format!("bytes={offset}-{requested_end}"));
-        if let Some(cookie) = cookie {
-            request = request.header(COOKIE, cookie);
-        }
-        let response = noted(
-            request.send().map_err(|_| "下载请求失败".into()),
-            "response-request-error",
-        )?;
-        match response.status() {
-            StatusCode::OK if offset == 0 => {
-                copy_bounded(response, output, None, with_current)?;
-                return Ok(());
-            }
-            StatusCode::PARTIAL_CONTENT => {
-                let content_range = noted(
-                    response
-                        .headers()
-                        .get(CONTENT_RANGE)
-                        .ok_or("206 响应缺少 Content-Range".into())
-                        .and_then(|value| value.to_str().map_err(|_| "Content-Range 无效".into())),
-                    "response-range-error",
-                )?;
-                let (actual_end, total) = noted(
-                    parse_content_range(content_range, offset, requested_end),
-                    "response-range-error",
-                )?;
-                if expected_total.is_some_and(|expected| expected != total) {
-                    diagnostic("response-total-changed");
-                    return Err("下载文件总长度在分块间变化".into());
-                }
-                expected_total = Some(total);
-                copy_bounded(
-                    response,
-                    output,
-                    Some(actual_end - offset + 1),
-                    with_current,
-                )?;
-                if actual_end + 1 == total {
-                    return Ok(());
-                }
-                offset = actual_end + 1;
-            }
-            _ => {
-                diagnostic("response-status-error");
-                return Err("下载服务返回了不符合请求范围的响应".into());
-            }
-        }
-    }
-}
-
 fn stream_command_to_file(
     program: &str,
     args: &[String],
@@ -850,66 +595,6 @@ fn stream_ssh_to_file(args: &[String], output: &mut fs::File) -> Result<(), Stri
     stream_command_to_file("ssh", args, output)
 }
 
-fn parse_content_range(
-    value: &str,
-    expected_start: u64,
-    requested_end: u64,
-) -> Result<(u64, u64), String> {
-    let range = value
-        .strip_prefix("bytes ")
-        .ok_or("Content-Range 单位无效")?;
-    let (range, total) = range.split_once('/').ok_or("Content-Range 无效")?;
-    let (start, end) = range.split_once('-').ok_or("Content-Range 无效")?;
-    let start = start.parse::<u64>().map_err(|_| "Content-Range 起点无效")?;
-    let end = end.parse::<u64>().map_err(|_| "Content-Range 终点无效")?;
-    let total = total.parse::<u64>().map_err(|_| "Content-Range 总长无效")?;
-    if start != expected_start || end < start || end > requested_end {
-        return Err("Content-Range 与请求范围不一致".into());
-    }
-    if total <= end {
-        return Err("Content-Range 总长无效".into());
-    }
-    Ok((end, total))
-}
-
-fn copy_bounded(
-    mut response: Response,
-    output: &mut fs::File,
-    expected_length: Option<u64>,
-    with_current: &dyn Fn(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
-) -> Result<(), String> {
-    let mut buffer = [0_u8; READ_BUFFER_SIZE];
-    let mut written = 0_u64;
-    loop {
-        with_current(&mut || Ok(()))?;
-        let count = noted(
-            response
-                .read(&mut buffer)
-                .map_err(|error| format!("下载读取失败：{error}")),
-            "response-read-error",
-        )?;
-        if count == 0 {
-            break;
-        }
-        written = written.checked_add(count as u64).ok_or("下载文件过大")?;
-        if expected_length.is_some_and(|expected| written > expected) {
-            diagnostic("response-length-error");
-            return Err("服务返回了超出 Range 的数据".into());
-        }
-        noted(
-            output
-                .write_all(&buffer[..count])
-                .map_err(|_| "下载写入失败".into()),
-            "write-error",
-        )?;
-    }
-    if expected_length.is_some_and(|expected| expected != written) {
-        diagnostic("response-short-read");
-        return Err("下载响应短读".into());
-    }
-    Ok(())
-}
-
 #[cfg(target_os = "macos")]
 fn atomic_rename(source: &Path, destination: &Path, overwrite: bool) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
@@ -930,211 +615,13 @@ fn atomic_rename(source: &Path, destination: &Path, overwrite: bool) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
     use std::{
-        collections::HashMap,
         fs,
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        path::Path,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
-        },
+        io::Write,
+        sync::{Arc, atomic::Ordering},
         thread,
-        time::Duration,
     };
     use tempfile::TempDir;
-
-    const TEST_COOKIE: &str = "dsh_test_session=synthetic-only";
-
-    #[derive(Clone, Debug)]
-    struct FixtureRequest {
-        headers: HashMap<String, String>,
-    }
-
-    impl FixtureRequest {
-        fn range(&self) -> Option<(u64, u64)> {
-            let value = self.headers.get("range")?;
-            let value = value.strip_prefix("bytes=")?;
-            let (start, end) = value.split_once('-')?;
-            Some((start.parse().ok()?, end.parse().ok()?))
-        }
-    }
-
-    struct FixtureResponse {
-        status: u16,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
-    }
-
-    impl FixtureResponse {
-        fn new(status: u16, body: Vec<u8>) -> Self {
-            Self {
-                status,
-                headers: vec![],
-                body,
-            }
-        }
-
-        fn header(mut self, name: &str, value: String) -> Self {
-            self.headers.push((name.to_owned(), value));
-            self
-        }
-    }
-
-    struct TestServer {
-        origin: Url,
-        requests: Arc<Mutex<Vec<FixtureRequest>>>,
-        stop: Arc<AtomicBool>,
-        worker: Option<thread::JoinHandle<()>>,
-    }
-
-    impl TestServer {
-        fn start<F>(handler: F) -> Self
-        where
-            F: Fn(&FixtureRequest) -> FixtureResponse + Send + 'static,
-        {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let address = listener.local_addr().unwrap();
-            let origin = Url::parse(&format!("http://{address}/")).unwrap();
-            let requests = Arc::new(Mutex::new(vec![]));
-            let recorded = requests.clone();
-            let stop = Arc::new(AtomicBool::new(false));
-            let stopped = stop.clone();
-            let worker = thread::spawn(move || {
-                while !stopped.load(Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            // Accepted sockets inherit the listener's nonblocking flag on macOS.
-                            stream.set_nonblocking(false).unwrap();
-                            let request = read_request(&mut stream);
-                            recorded.lock().unwrap().push(request.clone());
-                            write_response(&mut stream, handler(&request));
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(2));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-            Self {
-                origin,
-                requests,
-                stop,
-                worker: Some(worker),
-            }
-        }
-
-        fn url(&self) -> Url {
-            self.origin.join("artifact.apk").unwrap()
-        }
-
-        fn requests(&self) -> Vec<FixtureRequest> {
-            self.requests.lock().unwrap().clone()
-        }
-    }
-
-    impl Drop for TestServer {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::SeqCst);
-            if let Some(worker) = self.worker.take() {
-                worker.join().unwrap();
-            }
-        }
-    }
-
-    fn read_request(stream: &mut TcpStream) -> FixtureRequest {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut bytes = vec![];
-        let mut buffer = [0_u8; 4096];
-        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-            let count = stream.read(&mut buffer).unwrap();
-            assert_ne!(count, 0, "client closed before sending request headers");
-            bytes.extend_from_slice(&buffer[..count]);
-        }
-        let text = String::from_utf8(bytes).unwrap();
-        let mut headers = HashMap::new();
-        for line in text.split("\r\n").skip(1) {
-            if line.is_empty() {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':') {
-                headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
-            }
-        }
-        FixtureRequest { headers }
-    }
-
-    fn write_response(stream: &mut TcpStream, response: FixtureResponse) {
-        let reason = match response.status {
-            200 => "OK",
-            206 => "Partial Content",
-            302 => "Found",
-            _ => "Fixture",
-        };
-        let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, reason);
-        for (name, value) in response.headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
-        }
-        head.push_str(&format!(
-            "Content-Length: {}\r\nConnection: close\r\n\r\n",
-            response.body.len()
-        ));
-        stream.write_all(head.as_bytes()).unwrap();
-        stream.write_all(&response.body).unwrap();
-        stream.flush().unwrap();
-    }
-
-    fn synthetic_bytes(offset: u64, length: usize) -> Vec<u8> {
-        (0..length)
-            .map(|index| {
-                let position = offset + index as u64;
-                ((position * 31 + position / 251 + 17) & 0xff) as u8
-            })
-            .collect()
-    }
-
-    fn partial_response(request: &FixtureRequest, total: u64) -> FixtureResponse {
-        let (start, end) = request.range().expect("Range header required");
-        let length = (end - start + 1) as usize;
-        FixtureResponse::new(206, synthetic_bytes(start, length))
-            .header("Content-Range", format!("bytes {start}-{end}/{total}"))
-    }
-
-    fn hash_file(path: &Path) -> String {
-        let mut file = fs::File::open(path).unwrap();
-        let mut hash = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let count = file.read(&mut buffer).unwrap();
-            if count == 0 {
-                break;
-            }
-            hash.update(&buffer[..count]);
-        }
-        format!("{:x}", hash.finalize())
-    }
-
-    fn synthetic_hash(length: u64) -> String {
-        let mut hash = Sha256::new();
-        let mut offset = 0;
-        while offset < length {
-            let count = ((length - offset) as usize).min(64 * 1024);
-            hash.update(synthetic_bytes(offset, count));
-            offset += count as u64;
-        }
-        format!("{:x}", hash.finalize())
-    }
-
-    fn assert_failure_left_no_files(directory: &Path) {
-        let entries = fs::read_dir(directory).unwrap();
-        assert_eq!(entries.count(), 0, "failed download left files behind");
-    }
 
     const NODE_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
 
@@ -1369,230 +856,6 @@ mod tests {
     }
 
     #[test]
-    fn owner_loss_at_final_check_cleans_temp_without_committing_destination() {
-        let server = TestServer::start(|_| FixtureResponse::new(200, b"complete".to_vec()));
-        let directory = TempDir::new().unwrap();
-        let destination = directory.path().join("stale.apk");
-        let checks = std::sync::atomic::AtomicUsize::new(0);
-        let result = download_to_path_guarded(
-            &server.url(),
-            &server.origin,
-            None,
-            &destination,
-            false,
-            &|action| {
-                // 200 response: pre-temp, request, two bounded reads, then final commit.
-                if checks.fetch_add(1, Ordering::SeqCst) == 4 {
-                    Err("节点已关闭或已替换".into())
-                } else {
-                    action()
-                }
-            },
-        );
-        assert!(result.is_err());
-        assert!(!destination.exists());
-        assert_failure_left_no_files(directory.path());
-    }
-
-    #[test]
-    fn validate_source_rejects_all_fragments_including_credential_lookalikes() {
-        let origin = Url::parse("https://node.example:8443/").unwrap();
-        for suffix in ["#access_token=FRAGMENT_SENTINEL", "#"] {
-            let url = format!("https://node.example:8443/file{suffix}");
-            assert!(validate_source(&url, Some(&origin)).is_err());
-        }
-    }
-
-    fn fixture_cookie(
-        name: &'static str,
-        domain: Option<&'static str>,
-        path: Option<&'static str>,
-        secure: bool,
-    ) -> tauri::webview::Cookie<'static> {
-        let mut builder = tauri::webview::Cookie::build((name, "synthetic")).secure(secure);
-        if let Some(domain) = domain {
-            builder = builder.domain(domain);
-        }
-        if let Some(path) = path {
-            builder = builder.path(path);
-        }
-        builder.build()
-    }
-
-    fn filtered_cookie_names(
-        cookies: Vec<tauri::webview::Cookie<'static>>,
-        source: &str,
-    ) -> Vec<String> {
-        filter_cookies_for_source(cookies, &Url::parse(source).unwrap())
-            .into_iter()
-            .map(|cookie| cookie.name().to_owned())
-            .collect()
-    }
-
-    #[test]
-    fn cookie_filter_accepts_exact_loopback_ip_and_localhost_only() {
-        let cookies = vec![
-            fixture_cookie("ip", Some("127.0.0.1"), Some("/"), false),
-            fixture_cookie("other-ip", Some("127.0.0.2"), Some("/"), false),
-            fixture_cookie("localhost", Some("localhost"), Some("/"), false),
-            fixture_cookie("deceptive", Some("127.0.0.1.example.com"), Some("/"), false),
-            fixture_cookie("host-only", None, Some("/"), false),
-        ];
-        assert_eq!(
-            filtered_cookie_names(cookies.clone(), "http://127.0.0.1:3080/files/a.apk"),
-            ["ip"]
-        );
-        assert_eq!(
-            filtered_cookie_names(cookies, "http://localhost:3080/files/a.apk"),
-            ["localhost"]
-        );
-    }
-
-    #[test]
-    fn cookie_filter_does_not_suffix_match_unrelated_domains() {
-        let cookies = vec![
-            fixture_cookie("exact-node", Some("node.example.com"), Some("/"), false),
-            fixture_cookie("exact-parent", Some("example.com"), Some("/"), false),
-            fixture_cookie("dotted-parent", Some(".example.com"), Some("/"), false),
-            fixture_cookie("unrelated", Some("example.com.evil"), Some("/"), false),
-            fixture_cookie("dotted-other", Some(".other.example"), Some("/"), false),
-            fixture_cookie("public-suffix", Some(".com"), Some("/"), false),
-            fixture_cookie("dotted-localhost", Some(".localhost"), Some("/"), false),
-            fixture_cookie("host-only", None, Some("/"), false),
-        ];
-        assert_eq!(
-            filtered_cookie_names(cookies.clone(), "https://node.example.com/files/a.apk"),
-            ["exact-node"]
-        );
-        assert_eq!(
-            filtered_cookie_names(cookies.clone(), "https://example.com/files/a.apk"),
-            ["exact-parent", "dotted-parent"]
-        );
-        assert!(
-            filtered_cookie_names(cookies.clone(), "https://badexample.com/files/a.apk").is_empty()
-        );
-        assert!(filtered_cookie_names(cookies, "http://sub.localhost/files/a.apk").is_empty());
-    }
-
-    #[test]
-    fn cookie_filter_enforces_secure_and_preserves_loopback_exception() {
-        let cookies = vec![
-            fixture_cookie("secure", Some("node.example.com"), Some("/"), true),
-            fixture_cookie("plain", Some("node.example.com"), Some("/"), false),
-            fixture_cookie("secure-ip", Some("127.0.0.1"), Some("/"), true),
-            fixture_cookie("secure-local", Some("localhost"), Some("/"), true),
-        ];
-        assert_eq!(
-            filtered_cookie_names(cookies.clone(), "https://node.example.com/files/a.apk"),
-            ["secure", "plain"]
-        );
-        assert_eq!(
-            filtered_cookie_names(cookies.clone(), "http://node.example.com/files/a.apk"),
-            ["plain"]
-        );
-        assert_eq!(
-            filtered_cookie_names(cookies.clone(), "http://127.0.0.1:3080/files/a.apk"),
-            ["secure-ip"]
-        );
-        assert_eq!(
-            filtered_cookie_names(cookies, "http://localhost:3080/files/a.apk"),
-            ["secure-local"]
-        );
-    }
-
-    #[test]
-    fn cookie_filter_enforces_rfc_path_boundaries() {
-        let cookies = vec![
-            fixture_cookie("default", Some("node.example.com"), None, false),
-            fixture_cookie("root", Some("node.example.com"), Some("/"), false),
-            fixture_cookie("files", Some("node.example.com"), Some("/files"), false),
-            fixture_cookie(
-                "files-slash",
-                Some("node.example.com"),
-                Some("/files/"),
-                false,
-            ),
-            fixture_cookie("file", Some("node.example.com"), Some("/file"), false),
-            fixture_cookie("other", Some("node.example.com"), Some("/other"), false),
-            fixture_cookie("relative", Some("node.example.com"), Some("files"), false),
-        ];
-        assert_eq!(
-            filtered_cookie_names(cookies.clone(), "https://node.example.com/files/a.apk"),
-            ["default", "root", "files", "files-slash"]
-        );
-        assert_eq!(
-            filtered_cookie_names(cookies.clone(), "https://node.example.com/files2/a.apk"),
-            ["default", "root"]
-        );
-        assert_eq!(
-            filtered_cookie_names(cookies, "https://node.example.com/files"),
-            ["default", "root", "files"]
-        );
-    }
-
-    #[test]
-    fn validate_source_accepts_only_registered_safe_origins() {
-        let https = Url::parse("https://node.example:8443/root/").unwrap();
-        assert_eq!(
-            validate_source("https://node.example:8443/files/a.apk", Some(&https))
-                .unwrap()
-                .as_str(),
-            "https://node.example:8443/files/a.apk"
-        );
-        let loopback = Url::parse("http://127.0.0.1:3080/").unwrap();
-        assert!(validate_source("http://127.0.0.1:3080/file", Some(&loopback)).is_ok());
-        assert!(validate_source("https://other.example/file", Some(&https)).is_err());
-        assert!(validate_source("https://node.example:9443/file", Some(&https)).is_err());
-        assert!(validate_source("https://user@node.example:8443/file", Some(&https)).is_err());
-        assert!(validate_source("https://user:pw@node.example:8443/file", Some(&https)).is_err());
-        assert!(validate_source("file:///tmp/a.apk", Some(&https)).is_err());
-        assert!(
-            validate_source("https://node.example:8443/file?token=secret", Some(&https)).is_err()
-        );
-        assert!(validate_source("https://node.example:8443/file", None).is_err());
-        let remote_http = Url::parse("http://node.example/").unwrap();
-        assert!(validate_source("http://node.example/file", Some(&remote_http)).is_err());
-    }
-
-    #[test]
-    fn validate_source_rejects_normalized_common_credential_query_names() {
-        let origin = Url::parse("https://node.example:8443/").unwrap();
-        for key in [
-            "access_token",
-            "ACCESS-TOKEN",
-            "Access.Token",
-            "api_key",
-            "API-KEY",
-            "Api.Key",
-            "auth",
-            "AUTH",
-            "client_secret",
-            "refresh_token",
-            "id_token",
-            "auth_token",
-            "credential",
-            "session_id",
-            "cookie",
-            "signature",
-            "private_key",
-            "access%5Ftoken",
-        ] {
-            let url = format!("https://node.example:8443/file?{key}=synthetic");
-            assert!(
-                validate_source(&url, Some(&origin)).is_err(),
-                "accepted {key}"
-            );
-        }
-        assert!(
-            validate_source(
-                "https://node.example:8443/file?name=a.apk&download=1",
-                Some(&origin)
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
     fn safe_file_name_removes_paths_controls_and_special_names() {
         assert_eq!(safe_file_name("a.apk"), "a.apk");
         assert_eq!(safe_file_name(".apk"), ".apk");
@@ -1625,220 +888,23 @@ mod tests {
     }
 
     #[test]
-    fn range_download_streams_over_32_mib_with_exact_hash_offsets_and_cookie() {
-        let length = 32 * 1024 * 1024 + 12_345;
-        let server = TestServer::start(move |request| partial_response(request, length));
-        let directory = TempDir::new().unwrap();
-        let saved = download(
-            &server.url(),
-            &server.origin,
-            Some(TEST_COOKIE),
-            directory.path(),
-            "large.apk",
-        )
-        .unwrap();
-        assert_eq!(fs::metadata(&saved).unwrap().len(), length);
-        assert_eq!(hash_file(&saved), synthetic_hash(length));
-        let requests = server.requests();
-        let expected_ranges: Vec<_> = (0..length)
-            .step_by(1024 * 1024)
-            .map(|start| (start, (start + 1024 * 1024 - 1).min(length - 1)))
-            .collect();
+    fn resolve_ssh_config_maps_each_option() {
+        // tauri::test::mock_app requires the `test` feature; the mapping is a
+        // pure function, so the contract stays hermetic without an app handle.
+        let home = Some(PathBuf::from("/Users/dsh"));
+        assert_eq!(map_ssh_config(home.clone(), None).unwrap(), None);
+        assert_eq!(map_ssh_config(home.clone(), Some("default")).unwrap(), None);
         assert_eq!(
-            requests
-                .iter()
-                .map(|request| request.range())
-                .collect::<Vec<_>>(),
-            expected_ranges.into_iter().map(Some).collect::<Vec<_>>()
+            map_ssh_config(home.clone(), Some("none")).unwrap(),
+            Some(PathBuf::from("/dev/null"))
         );
-        assert_eq!(requests.last().unwrap().range().unwrap().1, length - 1);
-        assert!(requests.iter().all(|request| {
-            request.headers.get("cookie").map(String::as_str) == Some(TEST_COOKIE)
-        }));
-    }
-
-    #[test]
-    fn small_legal_206_response_uses_total_bounded_end_and_finishes() {
-        let server = TestServer::start(|request| {
-            assert_eq!(request.range(), Some((0, 1_048_575)));
-            FixtureResponse::new(206, synthetic_bytes(0, 1000))
-                .header("Content-Range", "bytes 0-999/1000".into())
-        });
-        let directory = TempDir::new().unwrap();
-        let saved = download(
-            &server.url(),
-            &server.origin,
-            None,
-            directory.path(),
-            "small.apk",
-        )
-        .unwrap();
-        assert_eq!(fs::read(saved).unwrap(), synthetic_bytes(0, 1000));
-        assert_eq!(server.requests().len(), 1);
-    }
-
-    #[test]
-    fn shorter_than_requested_ranges_advance_by_actual_end() {
-        let length = 2500;
-        let server = TestServer::start(move |request| {
-            let (start, _) = request.range().unwrap();
-            let actual_end = (start + 99).min(length - 1);
-            FixtureResponse::new(
-                206,
-                synthetic_bytes(start, (actual_end - start + 1) as usize),
-            )
-            .header(
-                "Content-Range",
-                format!("bytes {start}-{actual_end}/{length}"),
-            )
-        });
-        let directory = TempDir::new().unwrap();
-        let saved = download(
-            &server.url(),
-            &server.origin,
-            None,
-            directory.path(),
-            "short-ranges.apk",
-        )
-        .unwrap();
-        assert_eq!(hash_file(&saved), synthetic_hash(length));
-        let requests = server.requests();
-        let expected: Vec<_> = (0..length)
-            .step_by(100)
-            .map(|start| {
-                let requested_end = if start == 0 { 1_048_575 } else { length - 1 };
-                Some((start, requested_end))
-            })
-            .collect();
-        assert_eq!(
-            requests
-                .iter()
-                .map(|request| request.range())
-                .collect::<Vec<_>>(),
-            expected
-        );
-        assert_eq!(requests.len(), 25);
-    }
-
-    #[test]
-    fn initial_200_is_accepted_when_server_ignores_range() {
-        let server = TestServer::start(|_| FixtureResponse::new(200, b"complete".to_vec()));
-        let directory = TempDir::new().unwrap();
-        let saved = download(
-            &server.url(),
-            &server.origin,
-            None,
-            directory.path(),
-            "complete.apk",
-        )
-        .unwrap();
-        assert_eq!(fs::read(saved).unwrap(), b"complete");
-        assert_eq!(server.requests()[0].range(), Some((0, 1_048_575)));
-    }
-
-    #[test]
-    fn later_200_fails_and_removes_partial_file() {
-        let length = 1024 * 1024 + 1;
-        let server = TestServer::start(move |request| {
-            if request.range().unwrap().0 == 0 {
-                partial_response(request, length)
-            } else {
-                FixtureResponse::new(200, b"restarted".to_vec())
-            }
-        });
-        let directory = TempDir::new().unwrap();
-        assert!(
-            download(
-                &server.url(),
-                &server.origin,
-                None,
-                directory.path(),
-                "bad.apk",
-            )
-            .is_err()
-        );
-        assert_failure_left_no_files(directory.path());
-    }
-
-    #[test]
-    fn wrong_content_range_fails_and_removes_partial_file() {
-        let server = TestServer::start(|_| {
-            FixtureResponse::new(206, b"x".to_vec()).header("Content-Range", "bytes 1-1/2".into())
-        });
-        let directory = TempDir::new().unwrap();
-        assert!(
-            download(
-                &server.url(),
-                &server.origin,
-                None,
-                directory.path(),
-                "bad.apk",
-            )
-            .is_err()
-        );
-        assert_failure_left_no_files(directory.path());
-    }
-
-    #[test]
-    fn short_range_read_fails_and_removes_partial_file() {
-        let server = TestServer::start(|_| {
-            FixtureResponse::new(206, b"ab".to_vec()).header("Content-Range", "bytes 0-3/4".into())
-        });
-        let directory = TempDir::new().unwrap();
-        assert!(
-            download(
-                &server.url(),
-                &server.origin,
-                None,
-                directory.path(),
-                "bad.apk",
-            )
-            .is_err()
-        );
-        assert_failure_left_no_files(directory.path());
-    }
-
-    #[test]
-    fn cross_origin_redirect_is_rejected_without_leaking_cookie() {
-        let target = TestServer::start(|_| FixtureResponse::new(200, b"unexpected".to_vec()));
-        let target_url = target.url();
-        let source = TestServer::start(move |_| {
-            FixtureResponse::new(302, vec![]).header("Location", target_url.to_string())
-        });
-        let directory = TempDir::new().unwrap();
-        assert!(
-            download(
-                &source.url(),
-                &source.origin,
-                Some(TEST_COOKIE),
-                directory.path(),
-                "bad.apk",
-            )
-            .is_err()
-        );
-        assert!(target.requests().is_empty());
-        assert_failure_left_no_files(directory.path());
-    }
-
-    #[test]
-    fn redirects_are_bounded_and_clean_up() {
-        let server = TestServer::start(|request| {
-            let _ = request;
-            FixtureResponse::new(302, vec![]).header("Location", "/artifact.apk".into())
-        });
-        let directory = TempDir::new().unwrap();
-        assert!(
-            download(
-                &server.url(),
-                &server.origin,
-                None,
-                directory.path(),
-                "bad.apk",
-            )
-            .is_err()
-        );
-        assert!((2..=6).contains(&server.requests().len()));
-        assert_failure_left_no_files(directory.path());
+        let fleet = map_ssh_config(home.clone(), Some("fleet"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fleet, PathBuf::from("/Users/dsh/.ssh/dsh-fleet-config"));
+        assert!(fleet.ends_with(".ssh/dsh-fleet-config"));
+        assert!(map_ssh_config(home, Some("other")).is_err());
+        assert!(map_ssh_config(None, Some("fleet")).is_err());
     }
 
     #[test]
