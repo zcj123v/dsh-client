@@ -814,6 +814,42 @@ fn stream_download(
     }
 }
 
+fn stream_command_to_file(
+    program: &str,
+    args: &[String],
+    output: &mut fs::File,
+) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| format!("无法启动 {program}"))?;
+    // Drain stderr on a side thread and discard it: a full stderr pipe would
+    // block the remote side mid-stream, and its contents must never reach the
+    // returned error messages.
+    let stderr = child.stderr.take();
+    let drain_stderr = std::thread::spawn(move || {
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_end(&mut Vec::new());
+        }
+    });
+    let mut stdout = child.stdout.take().ok_or("远端读取失败".to_owned())?;
+    std::io::copy(&mut stdout, output).map_err(|_| "远端读取失败".to_owned())?;
+    let _ = drain_stderr.join();
+    let status = child.wait().map_err(|_| "远端读取失败".to_owned())?;
+    if !status.success() {
+        return Err("远端读取失败".to_owned());
+    }
+    Ok(())
+}
+
+fn stream_ssh_to_file(args: &[String], output: &mut fs::File) -> Result<(), String> {
+    stream_command_to_file("ssh", args, output)
+}
+
 fn parse_content_range(
     value: &str,
     expected_start: u64,
@@ -1827,5 +1863,22 @@ mod tests {
         assert!(args.contains(&"BatchMode=yes".to_string()));
         let no_config = ssh_read_args("dsh-mac", None, None, "/x").unwrap();
         assert!(!no_config.contains(&"-F".to_string()) && !no_config.contains(&"-l".to_string()));
+    }
+
+    #[test]
+    fn stream_command_to_file_copies_stdout_and_reports_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("源 文件.bin");
+        let payload: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&src, &payload).unwrap();
+        let mut out = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let path = src.to_str().unwrap();
+        stream_command_to_file("sh", &["-c".into(), format!("cat -- '{}'", path)], out.as_file_mut()).unwrap();
+        assert_eq!(fs::read(out.path()).unwrap(), payload);
+
+        let mut out2 = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let err = stream_command_to_file("sh", &["-c".into(), "cat -- /nonexistent/file; exit 1".into()], out2.as_file_mut()).unwrap_err();
+        assert!(!err.contains("No such file"), "remote stderr leaked: {err}");
+        assert_eq!(fs::read(out2.path()).unwrap().len(), 0);
     }
 }
