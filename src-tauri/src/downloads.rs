@@ -551,6 +551,58 @@ fn validate_source(raw: &str, registered_origin: Option<&Url>) -> Result<Url, St
     Ok(source)
 }
 
+fn remote_path_from_url(url: &Url) -> Result<String, String> {
+    let path = url
+        .query_pairs()
+        .find_map(|(key, value)| {
+            if key == "path" {
+                Some(value.into_owned())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+    if path.is_empty() || !path.starts_with('/') {
+        return Err("远端路径无效".into());
+    }
+    Ok(path)
+}
+
+fn ssh_read_args(
+    profile: &str,
+    user: Option<&str>,
+    config: Option<&str>,
+    path: &str,
+) -> Result<Vec<String>, String> {
+    // Mirror the `safe` closure rules of policy::ssh_args for profile/user;
+    // ssh_args itself is not reused because it assembles tunnel arguments.
+    let safe = |s: &str| {
+        !s.is_empty()
+            && s.len() < 256
+            && s.as_bytes()[0].is_ascii_alphanumeric()
+            && s
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._@:-".contains(&b))
+    };
+    if !safe(profile) || user.is_some_and(|u| !safe(u) || u.contains('@') || u.contains(':')) {
+        return Err("SSH Host 或用户无效".into());
+    }
+    let mut args = Vec::new();
+    if let Some(config) = config {
+        args.extend(["-F".into(), config.into()]);
+    }
+    args.extend(["-o".into(), "BatchMode=yes".into()]);
+    args.extend(["-o".into(), "StrictHostKeyChecking=yes".into()]);
+    if let Some(user) = user {
+        args.extend(["-l".into(), user.into()]);
+    }
+    args.push(profile.into());
+    // The first `--` ends ssh option parsing; `cat --` keeps a leading `-`
+    // out of cat's option parsing. The remote path stays a single argument.
+    args.extend(["--".into(), "cat".into(), "--".into(), path.into()]);
+    Ok(args)
+}
+
 fn safe_file_name(suggested: &str) -> String {
     if suggested
         .chars()
@@ -1751,5 +1803,29 @@ mod tests {
         );
         assert!((2..=6).contains(&server.requests().len()));
         assert_failure_left_no_files(directory.path());
+    }
+
+    #[test]
+    fn remote_path_from_url_extracts_absolute_path() {
+        let url = Url::parse("http://127.0.0.1:40286/api/file?path=/Users/x/Workspace/a%20b.apk").unwrap();
+        assert_eq!(remote_path_from_url(&url).unwrap(), "/Users/x/Workspace/a b.apk");
+        for bad in ["http://127.0.0.1:40286/api/file", "http://127.0.0.1:40286/api/file?path=", "http://127.0.0.1:40286/api/file?path=relative/x.apk"] {
+            assert!(remote_path_from_url(&Url::parse(bad).unwrap()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn ssh_read_args_passes_path_as_single_argument_after_double_dash() {
+        let args = ssh_read_args("dsh-mac", Some("u"), Some("/tmp/ssh_config"), "/p/a b/--x.apk").unwrap();
+        let dash = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[dash + 1], "cat");
+        assert_eq!(args[dash + 2], "--");
+        assert_eq!(args[dash + 3], "/p/a b/--x.apk");
+        assert_eq!(args.iter().filter(|a| *a == "--").count(), 2);
+        assert!(args.contains(&"-F".to_string()) && args.contains(&"/tmp/ssh_config".to_string()));
+        assert!(args.contains(&"-l".to_string()) && args.contains(&"u".to_string()));
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+        let no_config = ssh_read_args("dsh-mac", None, None, "/x").unwrap();
+        assert!(!no_config.contains(&"-F".to_string()) && !no_config.contains(&"-l".to_string()));
     }
 }
